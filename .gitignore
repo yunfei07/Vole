@@ -1,0 +1,14 @@
+node_modules
+dist/
+.tmp/
+.DS_Store
+.ai-pw/auth/
+.ai-pw/ai-cache/
+.ai-pw/artifacts/
+.ai-pw/kb-drafts/
+.ai-pw/kb.sqlite
+.ai-pw/generated/
+tests/generated/
+pages/
+test-results/
+playwright-report/
