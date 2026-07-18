@@ -50,7 +50,7 @@ tests/generated/
 export ZHIPU_API_KEY="..."
 ```
 
-`ai-pw.config.json` 中的 `ai.apiKeyEnv` 必须使用环境变量名，不要把密钥值提交到仓库。AI Runtime 使用 AI SDK v7；`structuredOutputMode: "auto"` 会在原生 JSON Schema 不兼容时自动降级。AI Agent 仍要求模型支持 OpenAI-compatible tool calling。
+配置文件位于 `.ai-pw/ai-pw.config.json`。`ai.apiKey` 可直接配置密钥，`ai.apiKeyEnv` 可配置环境变量名；该配置文件由 `init` 加入忽略规则，不要把密钥提交到仓库。AI Runtime 使用 AI SDK v7；`structuredOutputMode: "auto"` 会在原生 JSON Schema 不兼容时自动降级。AI Agent 仍要求模型支持 OpenAI-compatible tool calling。
 
 ## 快速开始
 
@@ -142,7 +142,7 @@ Agent 使用 AI SDK `ToolLoopAgent` 和 Zod typed tools，支持非流式/流式
 ```bash
 npm test
 npm run test:runtime-ai
-VOLE_LIVE_AI=1 ZHIPU_API_KEY=... npm run test:live-ai
+VOLE_LIVE_AI=1 npm run test:live-ai
 ```
 
 测试覆盖 Resolver fallback、生成代码、CDP DOM/AX 合并、敏感值清理、缓存、四项 Runtime 编排、数据库迁移和原有静态路径。

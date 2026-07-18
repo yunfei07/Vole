@@ -24,7 +24,7 @@ export async function kbScanCommand(options: KbScanOptions, cwd = process.cwd())
 
   const pages = options.all ? config.scanPages : scanTargetFromOptions(options);
   if (pages.length === 0) {
-    throw new Error('SCAN_FAILED: no pages configured; set scanPages in ai-pw.config.json or pass --name and --url');
+    throw new Error('SCAN_FAILED: no pages configured; set scanPages in .ai-pw/ai-pw.config.json or pass --name and --url');
   }
 
   if (!options.all && options.out && pages.length > 1) {
