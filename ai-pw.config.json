@@ -49,7 +49,8 @@
     "model": "glm-4.7",
     "temperature": 0.1,
     "timeoutMs": 30000,
-    "maxRetries": 2
+    "maxRetries": 2,
+    "structuredOutputMode": "auto"
   },
   "aiEnhancements": {
     "enabled": true,

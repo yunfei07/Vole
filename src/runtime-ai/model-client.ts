@@ -1,6 +1,20 @@
-import type { z } from 'zod';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import {
+  Output,
+  dynamicTool,
+  extractJsonMiddleware,
+  generateText,
+  jsonSchema,
+  streamText,
+  wrapLanguageModel,
+  type LanguageModel,
+  type ModelMessage as AiSdkModelMessage,
+  type ToolSet
+} from 'ai';
+import { z } from 'zod';
 import type { AiPwConfig } from '../config/schema.js';
 import { runtimeError } from './errors.js';
+import type { RuntimeModelUsage } from './types.js';
 
 export type ModelMessage = {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -27,25 +41,208 @@ export type ModelToolCall = {
   };
 };
 
-type ChatCompletionPayload = {
-  choices?: Array<{
-    message?: {
-      content?: string | null;
-      tool_calls?: ModelToolCall[];
-    };
-  }>;
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-  };
-  error?: {
-    message?: string;
-  };
+export type ModelCallMetadata = {
+  usage: RuntimeModelUsage;
+  finishReason: string;
+  warnings: unknown[];
+  providerMetadata?: unknown;
+  responseId?: string;
+  responseModel?: string;
+  durationMs: number;
 };
 
+export type ModelObjectResult<T> = ModelCallMetadata & {
+  value: T;
+  structuredOutputMode: 'native' | 'prompt';
+};
+
+export type ModelTextResult = ModelCallMetadata & {
+  text: string;
+  toolCalls: ModelToolCall[];
+  responseMessages: unknown[];
+};
+
+export type ModelCallLog = {
+  purpose: string;
+  model: string;
+  kind: 'object' | 'text';
+  metadata: ModelCallMetadata;
+  structuredOutputMode?: 'native' | 'prompt';
+  timestamp: string;
+};
+
+type ModelClientOptions = {
+  fetch?: typeof globalThis.fetch;
+};
+
+type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+type ProviderOptions = Record<string, Record<string, JsonValue>>;
+
+const promptModeModels = new Set<string>();
+
 export class RuntimeModelClient {
-  constructor(private readonly config: AiPwConfig) {}
+  private readonly nativeProvider;
+  private readonly promptProvider;
+  private readonly callHistory: ModelCallLog[] = [];
+
+  constructor(
+    private readonly config: AiPwConfig,
+    options: ModelClientOptions = {}
+  ) {
+    const common = {
+      name: 'vole',
+      baseURL: config.ai.baseURL.replace(/\/$/, ''),
+      apiKey: resolveApiKey(config),
+      includeUsage: true,
+      ...(options.fetch ? { fetch: options.fetch } : {})
+    };
+    this.nativeProvider = createOpenAICompatible({
+      ...common,
+      supportsStructuredOutputs: true
+    });
+    this.promptProvider = createOpenAICompatible({
+      ...common,
+      supportsStructuredOutputs: false
+    });
+  }
+
+  getLanguageModel(modelName?: string): LanguageModel {
+    return this.nativeProvider.chatModel(modelName ?? this.modelName());
+  }
+
+  getCallHistory(): readonly ModelCallLog[] {
+    return this.callHistory;
+  }
+
+  async generateObject<T>(input: {
+    purpose: string;
+    system: string;
+    user: unknown;
+    schema: z.ZodType<T>;
+    timeoutMs?: number;
+    abortSignal?: AbortSignal;
+    model?: string;
+    providerOptions?: ProviderOptions;
+    image?: { data: Uint8Array; mediaType: string };
+  }): Promise<ModelObjectResult<T>> {
+    const modelName = input.model ?? this.modelName();
+    const configuredMode = this.config.ai.structuredOutputMode;
+    const cacheKey = `${this.config.ai.baseURL}:${modelName}`;
+    const preferredMode = configuredMode === 'auto'
+      ? (promptModeModels.has(cacheKey) ? 'prompt' : 'native')
+      : configuredMode;
+
+    try {
+      const result = await this.runObject(input, modelName, preferredMode);
+      this.record({
+        purpose: input.purpose,
+        model: modelName,
+        kind: 'object',
+        metadata: metadataOnly(result),
+        structuredOutputMode: result.structuredOutputMode,
+        timestamp: new Date().toISOString()
+      });
+      return result;
+    } catch (error) {
+      if (
+        configuredMode !== 'auto' ||
+        preferredMode === 'prompt' ||
+        isCancellation(error) ||
+        !shouldFallbackToPrompt(error)
+      ) {
+        throw mapModelError(error, input.purpose);
+      }
+      promptModeModels.add(cacheKey);
+      try {
+        const result = await this.runObject(input, modelName, 'prompt');
+        this.record({
+          purpose: input.purpose,
+          model: modelName,
+          kind: 'object',
+          metadata: metadataOnly(result),
+          structuredOutputMode: result.structuredOutputMode,
+          timestamp: new Date().toISOString()
+        });
+        return result;
+      } catch (fallbackError) {
+        throw mapModelError(fallbackError, input.purpose);
+      }
+    }
+  }
+
+  async generateText(input: {
+    system: string;
+    messages?: AiSdkModelMessage[];
+    prompt?: string;
+    timeoutMs?: number;
+    abortSignal?: AbortSignal;
+    model?: string;
+    providerOptions?: ProviderOptions;
+    tools?: ToolSet;
+  }): Promise<ModelTextResult> {
+    const startedAt = Date.now();
+    try {
+      const result = await generateText({
+        model: this.getLanguageModel(input.model),
+        system: input.system,
+        ...(input.messages ? { messages: input.messages } : { prompt: input.prompt ?? '' }),
+        ...(input.tools ? { tools: input.tools } : {}),
+        toolChoice: input.tools ? 'auto' : undefined,
+        temperature: this.config.ai.temperature,
+        maxRetries: this.config.ai.maxRetries,
+        timeout: input.timeoutMs ?? this.config.ai.timeoutMs,
+        abortSignal: input.abortSignal,
+        providerOptions: input.providerOptions
+      });
+      const value: ModelTextResult = {
+        text: result.text,
+        toolCalls: result.toolCalls.map((call) => ({
+          id: call.toolCallId,
+          type: 'function',
+          function: {
+            name: call.toolName,
+            arguments: JSON.stringify(call.input ?? {})
+          }
+        })),
+        responseMessages: result.responseMessages,
+        ...metadata(result, startedAt)
+      };
+      this.record({
+        purpose: 'generateText',
+        model: input.model ?? this.modelName(),
+        kind: 'text',
+        metadata: metadataOnly(value),
+        timestamp: new Date().toISOString()
+      });
+      return value;
+    } catch (error) {
+      throw mapModelError(error, 'generateText');
+    }
+  }
+
+  stream(input: {
+    system: string;
+    messages?: AiSdkModelMessage[];
+    prompt?: string;
+    timeoutMs?: number;
+    abortSignal?: AbortSignal;
+    model?: string;
+    providerOptions?: ProviderOptions;
+    tools?: ToolSet;
+  }): ReturnType<typeof streamText> {
+    return streamText({
+      model: this.getLanguageModel(input.model),
+      system: input.system,
+      ...(input.messages ? { messages: input.messages } : { prompt: input.prompt ?? '' }),
+      ...(input.tools ? { tools: input.tools } : {}),
+      toolChoice: input.tools ? 'auto' : undefined,
+      temperature: this.config.ai.temperature,
+      maxRetries: this.config.ai.maxRetries,
+      timeout: input.timeoutMs ?? this.config.ai.timeoutMs,
+      abortSignal: input.abortSignal,
+      providerOptions: input.providerOptions
+    });
+  }
 
   async completeJson<T>(input: {
     purpose: string;
@@ -54,160 +251,280 @@ export class RuntimeModelClient {
     schema: z.ZodType<T>;
     timeoutMs?: number;
   }): Promise<T> {
-    const response = await this.request(
-      [
-        {
-          role: 'system',
-          content: `${input.system}\nReturn one valid JSON value only. Do not return Markdown.`
-        },
-        {
-          role: 'user',
-          content: JSON.stringify(input.user)
-        }
-      ],
-      undefined,
-      input.timeoutMs
-    );
-
-    const content = response.content;
-    if (!content) {
-      throw runtimeError('AI_MODEL_INVALID_RESPONSE', `${input.purpose}: model returned empty content`);
-    }
-
-    try {
-      return input.schema.parse(JSON.parse(extractJson(content)));
-    } catch (error) {
-      throw runtimeError(
-        'AI_MODEL_INVALID_RESPONSE',
-        `${input.purpose}: response did not match the required schema`,
-        error instanceof Error ? error.message : String(error)
-      );
-    }
+    return (await this.generateObject(input)).value;
   }
 
   async completeWithTools(
     messages: ModelMessage[],
     tools: ModelTool[],
     timeoutMs?: number
-  ): Promise<{ content: string | null; toolCalls: ModelToolCall[] }> {
-    const response = await this.request(messages, tools, timeoutMs);
-    if (response.toolCalls.length === 0 && !response.content) {
+  ): Promise<{ content: string | null; toolCalls: ModelToolCall[]; usage?: RuntimeModelUsage }> {
+    const toolSet = Object.fromEntries(tools.map((definition) => [
+      definition.function.name,
+      dynamicTool({
+        description: definition.function.description,
+        inputSchema: jsonSchema(definition.function.parameters)
+      })
+    ]));
+    const converted = convertMessages(messages);
+    const result = await this.generateText({
+      system: converted.system,
+      messages: converted.messages,
+      tools: toolSet,
+      timeoutMs
+    });
+    if (result.toolCalls.length === 0 && !result.text) {
       throw runtimeError(
         'AI_MODEL_CAPABILITY_UNSUPPORTED',
         'the configured model returned neither a tool call nor a final response'
       );
     }
-    return response;
+    return {
+      content: result.text || null,
+      toolCalls: result.toolCalls,
+      usage: result.usage
+    };
   }
 
-  private async request(
-    messages: ModelMessage[],
-    tools?: ModelTool[],
-    timeoutMs?: number
-  ): Promise<{ content: string | null; toolCalls: ModelToolCall[] }> {
-    const apiKey = resolveApiKey(this.config);
-    if (!apiKey) {
-      throw runtimeError(
-        'AI_MODEL_REQUEST_FAILED',
-        `environment variable ${this.config.ai.apiKeyEnv ?? '(not configured)'} is not set`
-      );
-    }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
-      timeoutMs ?? this.config.runtimeAi.timeoutMs
-    );
-
-    try {
-      const response = await retry(this.config.ai.maxRetries, async () => {
-        const result = await fetch(
-          `${this.config.ai.baseURL.replace(/\/$/, '')}/chat/completions`,
+  private async runObject<T>(
+    input: {
+      purpose: string;
+      system: string;
+      user: unknown;
+      schema: z.ZodType<T>;
+      timeoutMs?: number;
+      abortSignal?: AbortSignal;
+      providerOptions?: ProviderOptions;
+      image?: { data: Uint8Array; mediaType: string };
+    },
+    modelName: string,
+    mode: 'native' | 'prompt'
+  ): Promise<ModelObjectResult<T>> {
+    const startedAt = Date.now();
+    const baseModel = mode === 'native'
+      ? this.nativeProvider.chatModel(modelName)
+      : this.promptProvider.chatModel(modelName);
+    const model = mode === 'prompt'
+      ? wrapLanguageModel({ model: baseModel, middleware: extractJsonMiddleware() })
+      : baseModel;
+    const userContent = input.image
+      ? [
+          { type: 'text' as const, text: JSON.stringify(input.user) },
           {
-            method: 'POST',
-            signal: controller.signal,
-            headers: {
-              authorization: `Bearer ${apiKey}`,
-              'content-type': 'application/json'
-            },
-            body: JSON.stringify({
-              model: this.config.runtimeAi.model ?? this.config.ai.model,
-              temperature: this.config.ai.temperature,
-              messages,
-              ...(tools ? { tools, tool_choice: 'auto' } : {})
-            })
+            type: 'image' as const,
+            image: input.image.data,
+            mediaType: input.image.mediaType
           }
-        );
+        ]
+      : JSON.stringify(input.user);
+    const wrapOutput =
+      (input.schema._def as { typeName?: z.ZodFirstPartyTypeKind }).typeName !==
+      z.ZodFirstPartyTypeKind.ZodObject;
+    const outputSchema = wrapOutput
+      ? z.object({ result: input.schema })
+      : input.schema;
+    const result = await generateText({
+      model,
+      system: [
+        input.system,
+        mode === 'prompt' ? 'Return exactly one JSON value matching the requested schema.' : ''
+      ].filter(Boolean).join('\n'),
+      messages: [{ role: 'user', content: userContent }],
+      output: Output.object<unknown>({
+        schema: outputSchema as z.ZodTypeAny,
+        name: safeSchemaName(input.purpose),
+        description: `Structured result for ${input.purpose}`
+      }),
+      temperature: this.config.ai.temperature,
+      maxRetries: this.config.ai.maxRetries,
+      timeout: input.timeoutMs ?? this.config.ai.timeoutMs,
+      abortSignal: input.abortSignal,
+      providerOptions: input.providerOptions
+    });
+    return {
+      value: (wrapOutput
+        ? (result.output as { result: T }).result
+        : result.output) as T,
+      structuredOutputMode: mode,
+      ...metadata(result, startedAt)
+    };
+  }
 
-        const payload = (await result.json()) as ChatCompletionPayload;
-        if (!result.ok) {
-          throw new Error(payload.error?.message ?? result.statusText);
-        }
-        return payload;
-      });
+  private modelName(): string {
+    return this.config.runtimeAi.model ?? this.config.ai.model;
+  }
 
-      const message = response.choices?.[0]?.message;
-      return {
-        content: message?.content ?? null,
-        toolCalls: message?.tool_calls ?? []
-      };
-    } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw runtimeError('AI_RUNTIME_TIMEOUT', 'model request timed out');
-      }
-      if (error instanceof Error && error.message.startsWith('AI_')) {
-        throw error;
-      }
-      throw runtimeError(
-        'AI_MODEL_REQUEST_FAILED',
-        error instanceof Error ? error.message : String(error)
-      );
-    } finally {
-      clearTimeout(timeout);
+  private record(entry: ModelCallLog): void {
+    this.callHistory.push(entry);
+    if (this.callHistory.length > 100) {
+      this.callHistory.splice(0, this.callHistory.length - 100);
     }
   }
 }
 
-function resolveApiKey(config: AiPwConfig): string | undefined {
+function convertMessages(messages: ModelMessage[]): {
+  system: string;
+  messages: AiSdkModelMessage[];
+} {
+  const system = messages
+    .filter((message) => message.role === 'system')
+    .map((message) => message.content ?? '')
+    .join('\n');
+  const toolNames = new Map<string, string>();
+  for (const message of messages) {
+    for (const call of message.tool_calls ?? []) {
+      toolNames.set(call.id, call.function.name);
+    }
+  }
+
+  const converted: AiSdkModelMessage[] = [];
+  for (const message of messages) {
+    if (message.role === 'system') {
+      continue;
+    }
+    if (message.role === 'user') {
+      converted.push({ role: 'user', content: message.content ?? '' });
+      continue;
+    }
+    if (message.role === 'assistant') {
+      const content: Array<
+        { type: 'text'; text: string } |
+        { type: 'tool-call'; toolCallId: string; toolName: string; input: unknown }
+      > = [];
+      if (message.content) {
+        content.push({ type: 'text', text: message.content });
+      }
+      for (const call of message.tool_calls ?? []) {
+        content.push({
+          type: 'tool-call',
+          toolCallId: call.id,
+          toolName: call.function.name,
+          input: parseJson(call.function.arguments)
+        });
+      }
+      converted.push({ role: 'assistant', content });
+      continue;
+    }
+    const toolCallId = message.tool_call_id ?? 'unknown-tool-call';
+    converted.push({
+      role: 'tool',
+      content: [{
+        type: 'tool-result',
+        toolCallId,
+        toolName: toolNames.get(toolCallId) ?? 'unknown',
+        output: { type: 'json', value: asJsonValue(parseJson(message.content ?? 'null')) }
+      }]
+    });
+  }
+  return { system, messages: converted };
+}
+
+function metadata(
+  result: {
+    usage: {
+      inputTokens?: number;
+      outputTokens?: number;
+      inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
+      outputTokenDetails?: { reasoningTokens?: number };
+    };
+    finishReason: string;
+    warnings?: unknown[];
+    providerMetadata?: unknown;
+    response?: { id?: string; modelId?: string };
+  },
+  startedAt: number
+): ModelCallMetadata {
+  const inputTokens = result.usage.inputTokens;
+  const outputTokens = result.usage.outputTokens;
+  return {
+    usage: {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens !== undefined && outputTokens !== undefined
+        ? inputTokens + outputTokens
+        : undefined,
+      reasoningTokens: result.usage.outputTokenDetails?.reasoningTokens,
+      cachedInputTokens: result.usage.inputTokenDetails?.cacheReadTokens,
+      cacheWriteTokens: result.usage.inputTokenDetails?.cacheWriteTokens
+    },
+    finishReason: result.finishReason,
+    warnings: result.warnings ?? [],
+    providerMetadata: result.providerMetadata,
+    responseId: result.response?.id,
+    responseModel: result.response?.modelId,
+    durationMs: Date.now() - startedAt
+  };
+}
+
+function metadataOnly(value: ModelCallMetadata): ModelCallMetadata {
+  return {
+    usage: { ...value.usage },
+    finishReason: value.finishReason,
+    warnings: [...value.warnings],
+    providerMetadata: value.providerMetadata,
+    responseId: value.responseId,
+    responseModel: value.responseModel,
+    durationMs: value.durationMs
+  };
+}
+
+function resolveApiKey(config: AiPwConfig): string {
   if (config.ai.apiKey) {
     return config.ai.apiKey;
   }
-  if (!config.ai.apiKeyEnv) {
-    return undefined;
+  const variable = config.ai.apiKeyEnv;
+  const value = variable ? process.env[variable] : undefined;
+  if (value) {
+    return value;
   }
-  const environmentValue = process.env[config.ai.apiKeyEnv];
-  if (environmentValue) {
-    return environmentValue;
+  if (variable && !/^[A-Z_][A-Z0-9_]*$/u.test(variable)) {
+    return variable;
   }
-  return /^[A-Z_][A-Z0-9_]*$/u.test(config.ai.apiKeyEnv)
-    ? undefined
-    : config.ai.apiKeyEnv;
+  throw runtimeError(
+    'AI_MODEL_REQUEST_FAILED',
+    `environment variable ${variable ?? '(not configured)'} is not set`
+  );
 }
 
-async function retry<T>(maxRetries: number, fn: () => Promise<T>): Promise<T> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-    }
+function mapModelError(error: unknown, purpose: string): Error {
+  if (error instanceof Error && error.name === 'AbortError') {
+    return runtimeError('AI_RUNTIME_TIMEOUT', `${purpose}: model request was aborted or timed out`);
   }
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  if (error instanceof Error && error.message.startsWith('AI_')) {
+    return error;
+  }
+  return runtimeError(
+    'AI_MODEL_REQUEST_FAILED',
+    `${purpose}: ${error instanceof Error ? error.message : String(error)}`
+  );
 }
 
-function extractJson(content: string): string {
-  const fenced = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/u);
-  if (fenced?.[1]) {
-    return fenced[1];
+function isCancellation(error: unknown): boolean {
+  return error instanceof Error &&
+    (error.name === 'AbortError' || /abort|timeout/iu.test(error.message));
+}
+
+function shouldFallbackToPrompt(error: unknown): boolean {
+  const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  return /structured|response.?format|json.?schema|schema validation|no object|invalid json/iu.test(message);
+}
+
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { value };
   }
-  const objectStart = content.indexOf('{');
-  const arrayStart = content.indexOf('[');
-  const start = [objectStart, arrayStart].filter((value) => value >= 0).sort((a, b) => a - b)[0];
-  if (start === undefined) {
-    return content;
+}
+
+function asJsonValue(value: unknown): JsonValue {
+  if (value === undefined) {
+    return null;
   }
-  const closing = content[start] === '[' ? ']' : '}';
-  const end = content.lastIndexOf(closing);
-  return end > start ? content.slice(start, end + 1) : content;
+  return JSON.parse(JSON.stringify(value)) as JsonValue;
+}
+
+function safeSchemaName(purpose: string): string {
+  const name = purpose.replace(/[^A-Za-z0-9_-]+/gu, '_').slice(0, 64);
+  return name || 'vole_output';
 }

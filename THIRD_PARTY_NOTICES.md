@@ -2,6 +2,9 @@
 
 Vole's AI Runtime design and portions of its browser automation behavior were informed by the Stagehand project.
 
+Behavioral reference: Stagehand commit
+`06289148e4193d67371f07bd80a58e3268520260`.
+
 ## Stagehand
 
 Copyright (c) 2024 Browserbase Inc.
@@ -25,4 +28,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-

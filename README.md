@@ -47,10 +47,10 @@ tests/generated/
 配置模型 API Key：
 
 ```bash
-export OPENAI_API_KEY="..."
+export ZHIPU_API_KEY="..."
 ```
 
-`ai-pw.config.json` 中的 `ai.apiKeyEnv` 推荐使用环境变量名，不要把密钥值提交到仓库。旧配置中的直接值暂时兼容。AI Agent 要求模型支持 OpenAI-compatible tool calling；四项 Runtime 能力均要求可靠的结构化 JSON 输出。
+`ai-pw.config.json` 中的 `ai.apiKeyEnv` 必须使用环境变量名，不要把密钥值提交到仓库。AI Runtime 使用 AI SDK v7；`structuredOutputMode: "auto"` 会在原生 JSON Schema 不兼容时自动降级。AI Agent 仍要求模型支持 OpenAI-compatible tool calling。
 
 ## 快速开始
 
@@ -114,9 +114,26 @@ await this.ai.agent({
 });
 ```
 
-底层使用当前 Playwright Page 的 Chromium CDP Session 合并 DOM Snapshot 与 Accessibility Tree。CDP 负责感知页面，动作仍由 Playwright Locator 执行，因而保留 auto-wait、actionability check 和 trace。
+也支持 Stagehand 风格调用：
 
-Agent 是有界 DOM 工具循环，默认最大 8 步、总超时 120 秒并限制同源导航。缓存和运行产物分别位于 `.ai-pw/ai-cache` 和 `.ai-pw/artifacts/ai`。
+```ts
+const actions = await this.ai.observe('找到提交按钮');
+await this.ai.act(actions[0]);
+
+const { pageText } = await this.ai.extract();
+const data = await this.ai.extract(
+  '提取当前订单状态',
+  z.object({ status: z.string() }),
+  { screenshot: true }
+);
+
+const agent = this.ai.agent({ mode: 'dom' });
+await agent.execute('完成订单审批并验证结果');
+```
+
+底层使用当前 Playwright Page 的 Chromium CDP Session 合并 DOM Snapshot 与 Accessibility Tree。元素 ID 使用 `frameOrdinal-backendNodeId`；selector scope、ignored subtree、iframe 和开放 shadow DOM 均在 Snapshot 阶段处理。动作仍由 Playwright Locator 执行，保留 auto-wait、actionability check 和 trace。
+
+Agent 使用 AI SDK `ToolLoopAgent` 和 Zod typed tools，支持非流式/流式实例、callbacks、自定义 tools、messages continuation、Zod output、usage 与 evidence。默认最大 8 步、总超时 120 秒并限制同源导航。缓存和运行产物分别位于 `.ai-pw/ai-cache` 和 `.ai-pw/artifacts/ai`。
 
 关闭 `runtimeAi.enabled` 后，零匹配步骤恢复为 unresolved，静态生成行为不变。
 
@@ -124,6 +141,8 @@ Agent 是有界 DOM 工具循环，默认最大 8 步、总超时 120 秒并限�
 
 ```bash
 npm test
+npm run test:runtime-ai
+VOLE_LIVE_AI=1 ZHIPU_API_KEY=... npm run test:live-ai
 ```
 
 测试覆盖 Resolver fallback、生成代码、CDP DOM/AX 合并、敏感值清理、缓存、四项 Runtime 编排、数据库迁移和原有静态路径。

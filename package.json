@@ -10,7 +10,9 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli/index.ts",
     "demo": "tsx src/demo/server.ts",
-    "test": "tsc -p tsconfig.json && node --test tests/unit/*.test.mjs"
+    "test": "tsc -p tsconfig.json && node --test tests/unit/*.test.mjs",
+    "test:runtime-ai": "tsc -p tsconfig.json && node --test tests/unit/model-client.test.mjs tests/unit/runtime-ai.test.mjs",
+    "test:live-ai": "tsc -p tsconfig.json && node --test tests/live/runtime-ai-live.test.mjs"
   },
   "dependencies": {
     "@ai-sdk/openai-compatible": "^3.0.12",
@@ -22,6 +24,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
+    "@types/json-schema": "^7.0.15",
     "@types/node": "^22.15.29",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"

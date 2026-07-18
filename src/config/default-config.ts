@@ -31,7 +31,8 @@ export const defaultConfig: AiPwConfig = {
     model: 'gpt-4.1',
     temperature: 0.1,
     timeoutMs: 30000,
-    maxRetries: 2
+    maxRetries: 2,
+    structuredOutputMode: 'auto'
   },
   aiEnhancements: {
     enabled: false,

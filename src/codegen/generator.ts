@@ -222,7 +222,8 @@ function renderAiFallback(methodName: string, resolvedStep: ResolvedStep): StepR
       `instruction: ${quote(step.rawText)}`,
       'variables: context'
     ];
-    body.push(`await this.ai.agent({ ${agentInput.join(', ')} });`);
+    body.push(`const aiResult = await this.ai.agent({ ${agentInput.join(', ')} });`);
+    body.push(`if (!aiResult.success) throw new Error(aiResult.message);`);
     return { methodName, rawText: step.rawText, body, usesAi: true };
   }
 
@@ -253,7 +254,10 @@ function renderAiFallback(methodName: string, resolvedStep: ResolvedStep): StepR
   return {
     methodName,
     rawText: step.rawText,
-    body: [`await this.ai.act({ ${values.join(', ')} });`],
+    body: [
+      `const aiResult = await this.ai.act({ ${values.join(', ')} });`,
+      `if (!aiResult.success) throw new Error(aiResult.message);`
+    ],
     usesAi: true
   };
 }

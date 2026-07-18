@@ -28,6 +28,28 @@ export class ActionExecutor {
     }
   }
 
+  descriptorFromSelector(selector: string, frameUrl?: string): LocatorDescriptor {
+    if (selector.startsWith('xpath=')) {
+      return { strategy: 'xpath', value: selector.slice('xpath='.length), frameUrl };
+    }
+    if (selector.startsWith('/')) {
+      return { strategy: 'xpath', value: selector, frameUrl };
+    }
+    return { strategy: 'css', value: selector, frameUrl };
+  }
+
+  selector(descriptor: LocatorDescriptor): string {
+    return descriptor.strategy === 'xpath'
+      ? `xpath=${descriptor.value}`
+      : descriptor.strategy === 'css'
+        ? descriptor.value
+        : descriptor.strategy === 'testId'
+          ? `[data-testid=${JSON.stringify(descriptor.value)}]`
+          : descriptor.strategy === 'role'
+            ? `role=${descriptor.value}[name=${JSON.stringify(descriptor.name ?? '')}]`
+            : `${descriptor.strategy}=${JSON.stringify(descriptor.value)}`;
+  }
+
   async isUsable(descriptor: LocatorDescriptor, timeoutMs = 1500): Promise<boolean> {
     try {
       const locator = this.locator(descriptor);
@@ -42,6 +64,7 @@ export class ActionExecutor {
     locator: LocatorDescriptor;
     value?: string;
     filePath?: string;
+    targetLocator?: LocatorDescriptor;
     timeoutMs: number;
   }): Promise<void> {
     const locator = this.locator(input.locator);
@@ -59,7 +82,11 @@ export class ActionExecutor {
       case 'fill':
         await locator.fill(input.value ?? '', { timeout });
         return;
+      case 'type':
+        await locator.pressSequentially(input.value ?? '', { timeout });
+        return;
       case 'selectOption':
+      case 'selectOptionFromDropdown':
         await locator.selectOption({ label: input.value ?? '' }, { timeout });
         return;
       case 'setInputFiles':
@@ -70,6 +97,21 @@ export class ActionExecutor {
         return;
       case 'press':
         await locator.press(input.value || 'Enter', { timeout });
+        return;
+      case 'scrollTo':
+        await locator.scrollIntoViewIfNeeded({ timeout });
+        return;
+      case 'nextChunk':
+        await this.page.mouse.wheel(0, 700);
+        return;
+      case 'prevChunk':
+        await this.page.mouse.wheel(0, -700);
+        return;
+      case 'dragAndDrop':
+        if (!input.targetLocator) {
+          throw runtimeError('AI_ACT_FAILED', 'dragAndDrop requires a target element');
+        }
+        await locator.dragTo(this.locator(input.targetLocator), { timeout });
         return;
     }
   }
@@ -108,4 +150,3 @@ function sameDocumentUrl(left: string, right: string): boolean {
     return left === right;
   }
 }
-

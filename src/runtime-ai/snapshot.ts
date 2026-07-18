@@ -39,6 +39,9 @@ type AxResponse = {
   nodes?: AxNode[];
 };
 
+const SCOPE_ATTRIBUTE = 'data-vole-snapshot-scope';
+const IGNORE_ATTRIBUTE = 'data-vole-snapshot-ignore';
+
 export class PageSnapshotter {
   private session?: CDPSession;
 
@@ -47,8 +50,13 @@ export class PageSnapshotter {
     private readonly maxChars: number
   ) {}
 
-  async capture(selector?: string): Promise<PageSnapshot> {
+  async capture(selector?: string, ignoreSelectors: string[] = []): Promise<PageSnapshot> {
+    const marker = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     try {
+      const marked = await this.mark(selector, ignoreSelectors, marker);
+      if (selector && marked.scopes === 0) {
+        throw runtimeError('AI_SNAPSHOT_FAILED', `snapshot selector matched no elements: ${selector}`);
+      }
       const session = await this.getSession();
       const [dom, ax] = await Promise.all([
         session.send('DOMSnapshot.captureSnapshot', {
@@ -64,14 +72,21 @@ export class PageSnapshotter {
         url: this.page.url(),
         title: await this.page.title(),
         maxChars: this.maxChars,
-        selector
+        selector,
+        scopeMarker: selector ? marker : undefined,
+        ignoreMarker: ignoreSelectors.length > 0 ? marker : undefined
       });
     } catch (error) {
+      if (error instanceof Error && error.message.startsWith('AI_')) {
+        throw error;
+      }
       throw runtimeError(
         'AI_SNAPSHOT_FAILED',
         'failed to capture Chromium DOM/AX snapshot',
         error instanceof Error ? error.message : String(error)
       );
+    } finally {
+      await this.clearMarkers(marker);
     }
   }
 
@@ -92,12 +107,67 @@ export class PageSnapshotter {
     this.session ??= await this.page.context().newCDPSession(this.page);
     return this.session;
   }
+
+  private async mark(
+    selector: string | undefined,
+    ignoreSelectors: string[],
+    marker: string
+  ): Promise<{ scopes: number; ignored: number }> {
+    let scopes = 0;
+    let ignored = 0;
+    for (const frame of this.page.frames()) {
+      if (selector) {
+        scopes += await frame.locator(selector).evaluateAll(
+          (elements, value) => {
+            for (const element of elements) {
+              element.setAttribute('data-vole-snapshot-scope', value);
+            }
+            return elements.length;
+          },
+          marker
+        ).catch(() => 0);
+      }
+      for (const ignoredSelector of ignoreSelectors) {
+        ignored += await frame.locator(ignoredSelector).evaluateAll(
+          (elements, value) => {
+            for (const element of elements) {
+              element.setAttribute('data-vole-snapshot-ignore', value);
+            }
+            return elements.length;
+          },
+          marker
+        ).catch(() => 0);
+      }
+    }
+    return { scopes, ignored };
+  }
+
+  private async clearMarkers(marker: string): Promise<void> {
+    for (const frame of this.page.frames()) {
+      await frame.locator(
+        `[${SCOPE_ATTRIBUTE}=${JSON.stringify(marker)}],` +
+        `[${IGNORE_ATTRIBUTE}=${JSON.stringify(marker)}]`
+      ).evaluateAll((elements) => {
+        for (const element of elements) {
+          element.removeAttribute('data-vole-snapshot-scope');
+          element.removeAttribute('data-vole-snapshot-ignore');
+        }
+      }).catch(() => undefined);
+    }
+  }
 }
 
 export function buildSnapshot(
   dom: DomSnapshotResponse,
   ax: AxResponse,
-  options: { url: string; title: string; maxChars: number; selector?: string }
+  options: {
+    url: string;
+    title: string;
+    maxChars: number;
+    selector?: string;
+    scopeMarker?: string;
+    ignoreMarker?: string;
+  }
 ): PageSnapshot {
   const strings = dom.strings ?? [];
   const axByBackendId = new Map<number, AxNode>();
@@ -108,7 +178,10 @@ export function buildSnapshot(
   }
 
   const snapshotNodes: SnapshotNode[] = [];
-  for (const document of dom.documents ?? []) {
+  const elementIdToXpath: Record<string, string> = {};
+  const xpathToElementId: Record<string, string> = {};
+  const urlMap: Record<string, string> = {};
+  for (const [frameOrdinal, document] of (dom.documents ?? []).entries()) {
     const nodes = document.nodes;
     if (!nodes) {
       continue;
@@ -122,8 +195,31 @@ export function buildSnapshot(
       }
     }
 
+    const attributesByIndex = (nodes.nodeName ?? []).map((_, index) =>
+      attributesAt(strings, nodes.attributes?.[index])
+    );
+    const scopeRoots = new Set<number>();
+    const ignoreRoots = new Set<number>();
+    for (const [index, attributes] of attributesByIndex.entries()) {
+      if (options.scopeMarker && attributes[SCOPE_ATTRIBUTE] === options.scopeMarker) {
+        scopeRoots.add(index);
+      }
+      if (options.ignoreMarker && attributes[IGNORE_ATTRIBUTE] === options.ignoreMarker) {
+        ignoreRoots.add(index);
+      }
+    }
+    if (options.scopeMarker && scopeRoots.size === 0) {
+      continue;
+    }
+
     for (let index = 0; index < (nodes.nodeName?.length ?? 0); index += 1) {
       if (nodes.nodeType?.[index] !== 1) {
+        continue;
+      }
+      if (scopeRoots.size > 0 && !isWithin(index, scopeRoots, nodes.parentIndex)) {
+        continue;
+      }
+      if (ignoreRoots.size > 0 && isWithin(index, ignoreRoots, nodes.parentIndex)) {
         continue;
       }
       const backendNodeId = nodes.backendNodeId?.[index];
@@ -131,7 +227,7 @@ export function buildSnapshot(
         continue;
       }
       const tag = stringAt(strings, nodes.nodeName?.[index]).toLowerCase();
-      const attributes = attributesAt(strings, nodes.attributes?.[index]);
+      const attributes = attributesByIndex[index] ?? {};
       const axNode = axByBackendId.get(backendNodeId);
       const role = stringValue(axNode?.role);
       const name = stringValue(axNode?.name) || attributes['aria-label'] || attributes.title;
@@ -142,6 +238,7 @@ export function buildSnapshot(
       const bounds = layoutByNode.get(index);
       const visible = Boolean(bounds && bounds[2] > 0 && bounds[3] > 0 && attributes.hidden === undefined);
       const disabled = attributes.disabled !== undefined || axProperty(axNode, 'disabled') === true;
+      const xpath = absoluteXPath(index, nodes, strings);
       const locators = buildLocators({
         tag,
         role,
@@ -149,15 +246,17 @@ export function buildSnapshot(
         text,
         attributes,
         frameUrl: documentUrl,
-        xpath: absoluteXPath(index, nodes, strings)
+        xpath
       });
 
       if (!shouldIncludeNode({ tag, role, name, text, visible, locators })) {
         continue;
       }
 
+      const elementId = `${frameOrdinal}-${backendNodeId}`;
+      const href = attributes.href;
       snapshotNodes.push({
-        elementId: `e${snapshotNodes.length + 1}`,
+        elementId,
         backendNodeId,
         tag,
         role,
@@ -169,8 +268,17 @@ export function buildSnapshot(
         disabled,
         frameUrl: documentUrl,
         bounds,
-        locators
+        locators,
+        xpath,
+        href
       });
+      if (xpath) {
+        elementIdToXpath[elementId] = xpath;
+        xpathToElementId[`${frameOrdinal}:${xpath}`] = elementId;
+      }
+      if (href) {
+        urlMap[elementId] = href;
+      }
     }
   }
 
@@ -191,8 +299,22 @@ export function buildSnapshot(
     title: options.title,
     fingerprint,
     text: serialized,
-    nodes: snapshotNodes
+    nodes: snapshotNodes,
+    elementIdToXpath,
+    xpathToElementId,
+    urlMap
   };
+}
+
+function isWithin(index: number, roots: Set<number>, parents: number[] | undefined): boolean {
+  let current = index;
+  while (current >= 0) {
+    if (roots.has(current)) {
+      return true;
+    }
+    current = parents?.[current] ?? -1;
+  }
+  return false;
 }
 
 function shouldIncludeNode(input: {

@@ -76,7 +76,8 @@ export const aiPwConfigSchema = z.object({
     model: z.string().min(1),
     temperature: z.number().min(0).max(2),
     timeoutMs: z.number().int().positive(),
-    maxRetries: z.number().int().min(0)
+    maxRetries: z.number().int().min(0),
+    structuredOutputMode: z.enum(['auto', 'native', 'prompt']).default('auto')
   }).refine((value) => value.apiKey || value.apiKeyEnv, {
     message: 'ai.apiKey or ai.apiKeyEnv is required'
   }),
