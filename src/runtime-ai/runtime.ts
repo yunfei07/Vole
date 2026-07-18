@@ -154,7 +154,7 @@ export class AiRuntime {
         method: candidate.method as AiActionMethod,
         arguments: candidate.arguments ?? [],
         locator,
-        selector: node.xpath ? `xpath=${node.xpath}` : this.getExecutor().selector(locator)
+        selector: this.getExecutor().selector(locator)
       }];
     }).sort((a, b) => b.confidence - a.confidence);
     Object.defineProperty(candidates, 'cacheStatus', {
@@ -1112,14 +1112,12 @@ export class AiRuntime {
     });
     const description = plan.reasoning || input.instruction;
     const actions: AiAction[] = [{
-      selector: node.xpath ? `xpath=${node.xpath}` : this.getExecutor().selector(locator),
+      selector: this.getExecutor().selector(locator),
       description,
       method: action,
       arguments: action === 'dragAndDrop' && dragTargetNode && dragTargetLocator
         ? [
-            dragTargetNode.xpath
-              ? `xpath=${dragTargetNode.xpath}`
-              : this.getExecutor().selector(dragTargetLocator)
+            this.getExecutor().selector(dragTargetLocator)
           ]
         : plan.arguments
     }];
@@ -1159,9 +1157,7 @@ export class AiRuntime {
       finalAction = secondPlan.method;
       finalLocator = secondLocator;
       actions.push({
-        selector: secondNode.xpath
-          ? `xpath=${secondNode.xpath}`
-          : this.getExecutor().selector(secondLocator),
+        selector: this.getExecutor().selector(secondLocator),
         description: secondPlan.reasoning || `Complete ${input.instruction}`,
         method: secondPlan.method,
         arguments: secondPlan.arguments
