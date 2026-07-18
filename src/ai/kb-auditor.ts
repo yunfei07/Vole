@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import type { ElementRow } from '../kb/repository.js';
 import { requestAiJson } from './json-client.js';
 
@@ -22,7 +22,7 @@ const aiKbAuditSchema = z.object({
   }))
 });
 
-export async function auditKnowledgeBase(config: AiPwConfig, elements: ElementRow[]): Promise<KbAuditIssue[]> {
+export async function auditKnowledgeBase(config: VoleConfig, elements: ElementRow[]): Promise<KbAuditIssue[]> {
   const heuristicIssues = heuristicAudit(elements);
   if (!config.aiEnhancements.enabled || !config.aiEnhancements.kbAudit) {
     return heuristicIssues;

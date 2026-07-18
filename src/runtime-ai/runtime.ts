@@ -4,7 +4,7 @@ import type { Page } from '@playwright/test';
 import { ToolLoopAgent, hasToolCall, stepCountIs, tool as aiTool, type ToolSet } from 'ai';
 import { z } from 'zod';
 import { loadConfig } from '../config/load-config.js';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import { waitForPageReady } from '../playwright/page-readiness.js';
 import { ensureDir } from '../utils/fs.js';
 import { ActionExecutor } from './action-executor.js';
@@ -94,12 +94,12 @@ type RuntimeModel = Pick<RuntimeModelClient, 'completeJson' | 'completeWithTools
 
 export type CreateAiRuntimeOptions = {
   cwd?: string;
-  config?: AiPwConfig;
+  config?: VoleConfig;
   model?: RuntimeModel;
 };
 
 export class AiRuntime {
-  private configPromise?: Promise<AiPwConfig>;
+  private configPromise?: Promise<VoleConfig>;
   private snapshotter?: PageSnapshotter;
   private executor?: ActionExecutor;
   private model?: RuntimeModel;
@@ -635,7 +635,7 @@ export class AiRuntime {
   private async runSdkAgent(
     input: AiAgentInput,
     agentConfig: AiAgentConfig,
-    config: AiPwConfig,
+    config: VoleConfig,
     model: RuntimeModelClient
   ): Promise<AiAgentResult> {
     const history: AiAgentHistoryItem[] = [];
@@ -878,7 +878,7 @@ export class AiRuntime {
 
   private createSdkAgentTools(
     agentInput: AiAgentInput,
-    config: AiPwConfig,
+    config: VoleConfig,
     history: AiAgentHistoryItem[],
     customTools?: ToolSet
   ): ToolSet {
@@ -1016,7 +1016,7 @@ export class AiRuntime {
   private async replayTrajectory(
     cachedHistory: AiAgentHistoryItem[],
     input: AiAgentInput,
-    config: AiPwConfig
+    config: VoleConfig
   ): Promise<AiAgentHistoryItem[]> {
     const history: AiAgentHistoryItem[] = [];
     for (const item of transformHistoryVariables(cachedHistory, input.variables, 'hydrate')) {
@@ -1208,7 +1208,7 @@ export class AiRuntime {
     name: string,
     input: Record<string, unknown>,
     agentInput: AiAgentInput,
-    config: AiPwConfig
+    config: VoleConfig
   ): Promise<unknown> {
     switch (name) {
       case 'observe':
@@ -1310,7 +1310,7 @@ export class AiRuntime {
   }
 
   private async completeObject<T>(
-    config: AiPwConfig,
+    config: VoleConfig,
     input: Omit<Parameters<RuntimeModelClient['generateObject']>[0], 'schema'> & {
       schema: z.ZodTypeAny;
     }
@@ -1329,7 +1329,7 @@ export class AiRuntime {
     };
   }
 
-  private async config(): Promise<AiPwConfig> {
+  private async config(): Promise<VoleConfig> {
     this.configPromise ??= this.options.config
       ? Promise.resolve(this.options.config)
       : loadConfig(this.options.cwd ?? process.cwd());
@@ -1357,12 +1357,12 @@ export class AiRuntime {
     return this.executor;
   }
 
-  private getModel(config: AiPwConfig): RuntimeModel {
+  private getModel(config: VoleConfig): RuntimeModel {
     this.model ??= this.options.model ?? new RuntimeModelClient(config);
     return this.model;
   }
 
-  private getCache(config: AiPwConfig): AiRuntimeCache {
+  private getCache(config: VoleConfig): AiRuntimeCache {
     this.cache ??= new AiRuntimeCache(path.resolve(
       this.options.cwd ?? process.cwd(),
       config.runtimeAi.cacheDir

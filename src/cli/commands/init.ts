@@ -11,16 +11,16 @@ import { ensureDir, pathExists, writeFileIfMissing, writeJsonFile } from '../../
 import { resolveFromCwd } from '../../utils/paths.js';
 
 const projectDirs = [
-  '.ai-pw/auth',
-  '.ai-pw/artifacts/screenshots',
-  '.ai-pw/artifacts/traces',
-  '.ai-pw/artifacts/snapshots',
-  '.ai-pw/artifacts/results',
-  '.ai-pw/artifacts/ai',
-  '.ai-pw/ai-cache',
-  '.ai-pw/generated/plans',
-  '.ai-pw/generated/specs',
-  '.ai-pw/kb-drafts',
+  '.vole/auth',
+  '.vole/artifacts/screenshots',
+  '.vole/artifacts/traces',
+  '.vole/artifacts/snapshots',
+  '.vole/artifacts/results',
+  '.vole/artifacts/ai',
+  '.vole/ai-cache',
+  '.vole/generated/plans',
+  '.vole/generated/specs',
+  '.vole/kb-drafts',
   'cases',
   'pages',
   'tests/generated',
@@ -28,13 +28,14 @@ const projectDirs = [
 ];
 
 const gitignoreEntries = [
-  '.ai-pw/ai-pw.config.json',
-  '.ai-pw/auth/',
-  '.ai-pw/artifacts/',
-  '.ai-pw/ai-cache/',
-  '.ai-pw/kb-drafts/',
-  '.ai-pw/kb.sqlite',
-  '.ai-pw/generated/',
+  'vole.config.json',
+  '.vole/vole.config.json',
+  '.vole/auth/',
+  '.vole/artifacts/',
+  '.vole/ai-cache/',
+  '.vole/kb-drafts/',
+  '.vole/kb.sqlite',
+  '.vole/generated/',
   'tests/generated/',
   'pages/',
   'test-results/',
@@ -59,9 +60,9 @@ export async function initCommand(cwd = process.cwd()): Promise<void> {
 
   const config = await loadConfig(cwd);
   await initializeDatabase(resolveFromCwd(cwd, config.knowledgeBase));
-  await writeJsonFile(path.resolve(cwd, '.ai-pw/generated/plans/.keep.json'), { createdBy: 'ai-pw init' });
+  await writeJsonFile(path.resolve(cwd, '.vole/generated/plans/.keep.json'), { createdBy: 'vole init' });
 
-  console.log('Initialized AI Playwright CLI project.');
+  console.log('Initialized Vole CLI project.');
   console.log(`Config: ${configPath}`);
   console.log(`Knowledge base: ${resolveFromCwd(cwd, config.knowledgeBase)}`);
 }
@@ -78,7 +79,7 @@ async function ensureGitignoreEntries(gitignorePath: string): Promise<void> {
     if (existing.has(entry)) {
       return false;
     }
-    return !(entry.startsWith('.ai-pw/') && existing.has('.ai-pw/'));
+    return ![...existing].some((pattern) => pattern.endsWith('/') && entry.startsWith(pattern));
   });
   if (missing.length === 0) {
     return;

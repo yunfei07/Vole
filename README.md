@@ -31,7 +31,7 @@ node dist/cli/index.js init
 初始化会创建：
 
 ```text
-.ai-pw/
+.vole/
   ai-cache/
   auth/
   artifacts/
@@ -50,7 +50,7 @@ tests/generated/
 export ZHIPU_API_KEY="..."
 ```
 
-配置文件位于 `.ai-pw/ai-pw.config.json`。`ai.apiKey` 可直接配置密钥，`ai.apiKeyEnv` 可配置环境变量名；该配置文件由 `init` 加入忽略规则，不要把密钥提交到仓库。AI Runtime 使用 AI SDK v7；`structuredOutputMode: "auto"` 会在原生 JSON Schema 不兼容时自动降级。AI Agent 仍要求模型支持 OpenAI-compatible tool calling。
+配置文件位于 `.vole/vole.config.json`。`ai.apiKey` 可直接配置密钥，`ai.apiKeyEnv` 可配置环境变量名；该配置文件由 `init` 加入忽略规则，不要把密钥提交到仓库。AI Runtime 使用 AI SDK v7；`structuredOutputMode: "auto"` 会在原生 JSON Schema 不兼容时自动降级。AI Agent 仍要求模型支持 OpenAI-compatible tool calling。
 
 ## 快速开始
 
@@ -67,29 +67,29 @@ node dist/cli/index.js run tests/generated/case-example.spec.ts
 node dist/cli/index.js kb scan \
   --name "订单管理页面" \
   --url "/orders" \
-  --out ".ai-pw/kb-drafts/orders.json"
+  --out ".vole/kb-drafts/orders.json"
 
-node dist/cli/index.js kb import .ai-pw/kb-drafts/orders.json
+node dist/cli/index.js kb import .vole/kb-drafts/orders.json
 ```
 
 ## CLI
 
 ```text
-ai-pw init
-ai-pw auth login
+vole init
+vole auth login
 
-ai-pw kb scan [--name <name> --url <url> | --all] [--import]
-ai-pw kb import <draftPath>
-ai-pw kb audit [--page <name>]
-ai-pw kb list pages|elements|actions|runs
+vole kb scan [--name <name> --url <url> | --all] [--import]
+vole kb import <draftPath>
+vole kb audit [--page <name>]
+vole kb list pages|elements|actions|runs
 
-ai-pw case compile <casePath> [--parser ai|rules]
-ai-pw case resolve <planPath>
-ai-pw case generate <resolvedPlanPath>
-ai-pw case build [casePath | --all] [--parser ai|rules]
+vole case compile <casePath> [--parser ai|rules]
+vole case resolve <planPath>
+vole case generate <resolvedPlanPath>
+vole case build [casePath | --all] [--parser ai|rules]
 
-ai-pw run <specPath>
-ai-pw diagnose <runId|reportPath>
+vole run <specPath>
+vole diagnose <runId|reportPath>
 ```
 
 ## AI Runtime
@@ -133,7 +133,7 @@ await agent.execute('完成订单审批并验证结果');
 
 底层使用当前 Playwright Page 的 Chromium CDP Session 合并 DOM Snapshot 与 Accessibility Tree。元素 ID 使用 `frameOrdinal-backendNodeId`；selector scope、ignored subtree、iframe 和开放 shadow DOM 均在 Snapshot 阶段处理。动作仍由 Playwright Locator 执行，保留 auto-wait、actionability check 和 trace。
 
-Agent 使用 AI SDK `ToolLoopAgent` 和 Zod typed tools，支持非流式/流式实例、callbacks、自定义 tools、messages continuation、Zod output、usage 与 evidence。默认最大 8 步、总超时 120 秒并限制同源导航。缓存和运行产物分别位于 `.ai-pw/ai-cache` 和 `.ai-pw/artifacts/ai`。
+Agent 使用 AI SDK `ToolLoopAgent` 和 Zod typed tools，支持非流式/流式实例、callbacks、自定义 tools、messages continuation、Zod output、usage 与 evidence。默认最大 8 步、总超时 120 秒并限制同源导航。缓存和运行产物分别位于 `.vole/ai-cache` 和 `.vole/artifacts/ai`。
 
 关闭 `runtimeAi.enabled` 后，零匹配步骤恢复为 unresolved，静态生成行为不变。
 

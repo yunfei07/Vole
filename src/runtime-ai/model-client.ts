@@ -12,7 +12,7 @@ import {
   type ToolSet
 } from 'ai';
 import { z } from 'zod';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import { runtimeError } from './errors.js';
 import type { RuntimeModelUsage } from './types.js';
 
@@ -86,7 +86,7 @@ export class RuntimeModelClient {
   private readonly callHistory: ModelCallLog[] = [];
 
   constructor(
-    private readonly config: AiPwConfig,
+    private readonly config: VoleConfig,
     options: ModelClientOptions = {}
   ) {
     const common = {
@@ -468,7 +468,7 @@ function metadataOnly(value: ModelCallMetadata): ModelCallMetadata {
   };
 }
 
-function resolveApiKey(config: AiPwConfig): string {
+function resolveApiKey(config: VoleConfig): string {
   if (config.ai.apiKey) {
     return config.ai.apiKey;
   }

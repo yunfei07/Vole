@@ -34,8 +34,8 @@ const runtimeAiSchema = z.object({
   timeoutMs: z.number().int().positive().default(30000),
   selfHeal: z.boolean().default(true),
   snapshotMaxChars: z.number().int().min(5000).default(60000),
-  cacheDir: z.string().min(1).default('.ai-pw/ai-cache'),
-  artifactsDir: z.string().min(1).default('.ai-pw/artifacts/ai'),
+  cacheDir: z.string().min(1).default('.vole/ai-cache'),
+  artifactsDir: z.string().min(1).default('.vole/artifacts/ai'),
   agent: z.object({
     maxSteps: z.number().int().min(1).max(50).default(8),
     timeoutMs: z.number().int().positive().default(120000),
@@ -44,7 +44,7 @@ const runtimeAiSchema = z.object({
   }).default({})
 });
 
-export const aiPwConfigSchema = z.object({
+export const voleConfigSchema = z.object({
   projectName: z.string().min(1),
   baseUrl: z.string().min(1),
   testDir: z.string().min(1),
@@ -92,4 +92,4 @@ export const aiPwConfigSchema = z.object({
   pageReady: pageReadySchema.default({})
 });
 
-export type AiPwConfig = z.infer<typeof aiPwConfigSchema>;
+export type VoleConfig = z.infer<typeof voleConfigSchema>;

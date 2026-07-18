@@ -97,7 +97,7 @@ async function buildOneCase(
   const parsedCase = await parseMarkdownCase(resolvedCasePath);
   const parser = options.parser ?? 'ai';
   const plan = await compile(parser, config, parsedCase);
-  const planPath = path.resolve(cwd, '.ai-pw/generated/plans', `${slugify(plan.name) || 'case'}.plan.json`);
+  const planPath = path.resolve(cwd, '.vole/generated/plans', `${slugify(plan.name) || 'case'}.plan.json`);
   const resolvedPlanPath = planPath.replace(/\.plan\.json$/u, '.resolved.json');
 
   await ensureDir(path.dirname(planPath));
@@ -200,6 +200,6 @@ function unresolvedPlanError(plan: ResolvedPlan): Error {
     `RESOLVE_FAILED: plan is ${plan.status} ` +
       `(${plan.summary.resolved} static + ${plan.summary.aiFallback} AI fallback / ${plan.summary.total}).`,
     ...unresolved,
-    'Update the static knowledge base with "ai-pw kb scan" and "ai-pw kb import", then rerun case build.'
+    'Update the static knowledge base with "vole kb scan" and "vole kb import", then rerun case build.'
   ].join('\n'));
 }

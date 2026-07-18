@@ -22,7 +22,7 @@ export async function caseCompileCommand(casePath: string, options: CaseCompileO
   const plan = await compile(parser, config, parsedCase);
   const outPath = options.out
     ? resolveFromCwd(cwd, options.out)
-    : path.resolve(cwd, '.ai-pw/generated/plans', `${slugify(parsedCase.name) || 'case'}.plan.json`);
+    : path.resolve(cwd, '.vole/generated/plans', `${slugify(parsedCase.name) || 'case'}.plan.json`);
 
   await ensureDir(path.dirname(outPath));
   await writeJsonFile(outPath, plan);

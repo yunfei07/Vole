@@ -1,7 +1,7 @@
 import { chromium, type Page } from "@playwright/test";
 import path from "node:path";
 import { enhanceScanDraftWithAi } from "../ai/scan-enhancer.js";
-import type { AiPwConfig } from "../config/schema.js";
+import type { VoleConfig } from "../config/schema.js";
 import type { KbDraft, KbDraftElement } from "../kb/draft-schema.js";
 import { pathExists } from "../utils/fs.js";
 import { slugify } from "../utils/id.js";
@@ -61,7 +61,7 @@ export type ScanPageOptions = {
 
 export async function scanPage(
   cwd: string,
-  config: AiPwConfig,
+  config: VoleConfig,
   options: ScanPageOptions,
 ): Promise<KbDraft> {
   const storageStatePath = resolveFromCwd(cwd, config.auth.storageState);
@@ -518,7 +518,7 @@ async function collectRawElements(page: Page): Promise<RawScannedElement[]> {
 export function defaultDraftPath(cwd: string, pageName: string): string {
   return path.resolve(
     cwd,
-    ".ai-pw/kb-drafts",
+    ".vole/kb-drafts",
     `${slugify(pageName) || "page"}.elements.json`,
   );
 }

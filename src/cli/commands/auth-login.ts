@@ -5,7 +5,7 @@ import {
   type Page,
 } from "@playwright/test";
 import path from "node:path";
-import type { AiPwConfig } from "../../config/schema.js";
+import type { VoleConfig } from "../../config/schema.js";
 import { loadConfig } from "../../config/load-config.js";
 import { ensureDir } from "../../utils/fs.js";
 import { resolveFromCwd } from "../../utils/paths.js";
@@ -112,7 +112,7 @@ async function waitForReusableStorageState(
 
 async function verifySavedAuthState(
   browser: Browser,
-  config: AiPwConfig,
+  config: VoleConfig,
   storageStatePath: string,
   authenticatedUrl: string,
 ): Promise<void> {
@@ -153,7 +153,7 @@ async function verifySavedAuthState(
 
 async function assertLoginFormIsGone(
   page: Page,
-  config: AiPwConfig,
+  config: VoleConfig,
 ): Promise<void> {
   const loginUrl = joinUrl(config.baseUrl, config.auth.loginUrl);
   if (!isSamePageUrl(page.url(), loginUrl)) {

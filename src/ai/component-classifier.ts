@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import type { KbDraft } from '../kb/draft-schema.js';
 import { requestAiJson } from './json-client.js';
 
@@ -30,7 +30,7 @@ export const componentClassificationSchema = z.object({
 
 export type ComponentClassification = z.infer<typeof componentClassificationSchema>;
 
-export async function classifyComponentsWithAi(config: AiPwConfig, draft: KbDraft): Promise<ComponentClassification | undefined> {
+export async function classifyComponentsWithAi(config: VoleConfig, draft: KbDraft): Promise<ComponentClassification | undefined> {
   if (!config.aiEnhancements.enabled || !config.aiEnhancements.componentClassification) {
     return undefined;
   }

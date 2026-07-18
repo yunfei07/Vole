@@ -16,11 +16,11 @@ import { runCommand } from './commands/run.js';
 const program = new Command();
 
 program
-  .name('ai-pw')
-  .description('AI Playwright CLI automation test generator')
+  .name('vole')
+  .description('Vole CLI automation test generator')
   .version('0.1.0');
 
-program.command('init').description('Initialize ai-pw project files').action(async () => {
+program.command('init').description('Initialize vole project files').action(async () => {
   await initCommand();
 });
 
@@ -43,7 +43,7 @@ kb.command('scan')
   .description('Scan page(s) and generate editable knowledge-base draft(s)')
   .option('--name <name>', 'page semantic name')
   .option('--url <url>', 'page URL or path')
-  .option('--all', 'scan all pages configured in .ai-pw/ai-pw.config.json scanPages')
+  .option('--all', 'scan all pages configured in .vole/vole.config.json scanPages')
   .option('--import', 'import scanned draft(s) into knowledge base')
   .option('--out <path>', 'draft output path')
   .option('--headed', 'run browser headed')

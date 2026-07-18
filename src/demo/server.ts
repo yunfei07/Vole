@@ -2,7 +2,7 @@ import http from 'node:http';
 import { URLSearchParams } from 'node:url';
 
 const host = '127.0.0.1';
-const port = Number(process.env.AI_PW_DEMO_PORT ?? 4173);
+const port = Number(process.env.VOLE_DEMO_PORT ?? 4173);
 
 function sendHtml(response: http.ServerResponse, html: string, statusCode = 200): void {
   response.writeHead(statusCode, { 'content-type': 'text/html; charset=utf-8' });
@@ -23,7 +23,7 @@ async function readBody(request: http.IncomingMessage): Promise<string> {
 }
 
 function isAuthenticated(request: http.IncomingMessage): boolean {
-  return request.headers.cookie?.includes('ai_pw_demo_session=ok') ?? false;
+  return request.headers.cookie?.includes('vole_demo_session=ok') ?? false;
 }
 
 function pageShell(title: string, body: string): string {
@@ -166,7 +166,7 @@ function headerNav(activePath: string): string {
   ];
 
   return `<header>
-  <div>AI Playwright Demo</div>
+  <div>Vole Demo</div>
   <nav aria-label="主导航">
     ${items
       .map(([href, label]) => `<a href="${href}" ${href === activePath ? 'aria-current="page"' : ''}>${label}</a>`)
@@ -625,7 +625,7 @@ const server = http.createServer(async (request, response) => {
     const form = new URLSearchParams(await readBody(request));
     if (form.get('username') === 'admin' && form.get('password') === 'admin123') {
       redirect(response, '/orders', {
-        'set-cookie': 'ai_pw_demo_session=ok; Path=/; SameSite=Lax'
+        'set-cookie': 'vole_demo_session=ok; Path=/; SameSite=Lax'
       });
       return;
     }

@@ -1,9 +1,9 @@
 import type { Page } from '@playwright/test';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 
 export async function waitForPageReady(
   page: Page,
-  config: AiPwConfig,
+  config: VoleConfig,
   overrideWaitMs?: number
 ): Promise<void> {
   const ready = config.pageReady;

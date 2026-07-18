@@ -1,10 +1,10 @@
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import type { KbDraft } from '../kb/draft-schema.js';
 import { applyComponentClassification, classifyComponentsWithAi } from './component-classifier.js';
 import { applyLocatorRanking, rankLocatorsWithAi } from './locator-ranker.js';
 import { analyzePageWithAi, applyPageAnalysis } from './page-analyzer.js';
 
-export async function enhanceScanDraftWithAi(config: AiPwConfig, draft: KbDraft): Promise<KbDraft> {
+export async function enhanceScanDraftWithAi(config: VoleConfig, draft: KbDraft): Promise<KbDraft> {
   if (!config.aiEnhancements.enabled) {
     return draft;
   }

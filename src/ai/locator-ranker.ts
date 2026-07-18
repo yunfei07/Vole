@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import type { KbDraft } from '../kb/draft-schema.js';
 import { requestAiJson } from './json-client.js';
 
@@ -15,7 +15,7 @@ export const locatorRankingSchema = z.object({
 
 export type LocatorRanking = z.infer<typeof locatorRankingSchema>;
 
-export async function rankLocatorsWithAi(config: AiPwConfig, draft: KbDraft): Promise<LocatorRanking | undefined> {
+export async function rankLocatorsWithAi(config: VoleConfig, draft: KbDraft): Promise<LocatorRanking | undefined> {
   if (!config.aiEnhancements.enabled || !config.aiEnhancements.locatorRanking) {
     return undefined;
   }

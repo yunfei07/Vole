@@ -1,10 +1,10 @@
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import type { ParsedCase } from '../cases/markdown-parser.js';
 import { testPlanSchema, type TestPlan } from '../cases/test-plan-schema.js';
 import { RuntimeModelClient } from '../runtime-ai/model-client.js';
 
 export async function compileCaseWithAi(
-  config: AiPwConfig,
+  config: VoleConfig,
   parsedCase: ParsedCase
 ): Promise<TestPlan> {
   const client = new RuntimeModelClient(config);

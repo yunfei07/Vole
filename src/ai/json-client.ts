@@ -1,5 +1,5 @@
 import type { z } from 'zod';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import { RuntimeModelClient } from '../runtime-ai/model-client.js';
 
 export type AiJsonResult<T> =
@@ -7,7 +7,7 @@ export type AiJsonResult<T> =
   | { ok: false; error: string };
 
 export async function requestAiJson<T>(
-  config: AiPwConfig,
+  config: VoleConfig,
   input: {
     purpose: string;
     system: string;

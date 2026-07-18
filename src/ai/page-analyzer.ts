@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AiPwConfig } from '../config/schema.js';
+import type { VoleConfig } from '../config/schema.js';
 import type { KbDraft } from '../kb/draft-schema.js';
 import { requestAiJson } from './json-client.js';
 
@@ -28,7 +28,7 @@ export const pageAnalysisSchema = z.object({
 
 export type PageAnalysis = z.infer<typeof pageAnalysisSchema>;
 
-export async function analyzePageWithAi(config: AiPwConfig, draft: KbDraft): Promise<PageAnalysis | undefined> {
+export async function analyzePageWithAi(config: VoleConfig, draft: KbDraft): Promise<PageAnalysis | undefined> {
   if (!config.aiEnhancements.enabled || !config.aiEnhancements.pageAnalysis) {
     return undefined;
   }

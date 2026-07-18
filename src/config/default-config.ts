@@ -1,13 +1,13 @@
-import type { AiPwConfig } from './schema.js';
+import type { VoleConfig } from './schema.js';
 
-export const defaultConfig: AiPwConfig = {
+export const defaultConfig: VoleConfig = {
   projectName: 'admin-e2e',
   baseUrl: 'http://127.0.0.1:4173',
   testDir: 'tests/generated',
   pageObjectDir: 'pages',
   caseDir: 'cases',
-  knowledgeBase: '.ai-pw/kb.sqlite',
-  artifactsDir: '.ai-pw/artifacts',
+  knowledgeBase: '.vole/kb.sqlite',
+  artifactsDir: '.vole/artifacts',
   scanPages: [
     { name: '订单管理页面', url: '/orders' },
     { name: '用户管理页面', url: '/users' },
@@ -21,7 +21,7 @@ export const defaultConfig: AiPwConfig = {
     usernameSelector: "[data-testid='username']",
     passwordSelector: "[data-testid='password']",
     submitSelector: "[data-testid='login-submit']",
-    storageState: '.ai-pw/auth/storage-state.json'
+    storageState: '.vole/auth/storage-state.json'
   },
   locatorPreference: ['testId', 'role', 'label', 'placeholder', 'text', 'css', 'xpath'],
   ai: {
@@ -49,8 +49,8 @@ export const defaultConfig: AiPwConfig = {
     timeoutMs: 30000,
     selfHeal: true,
     snapshotMaxChars: 60000,
-    cacheDir: '.ai-pw/ai-cache',
-    artifactsDir: '.ai-pw/artifacts/ai',
+    cacheDir: '.vole/ai-cache',
+    artifactsDir: '.vole/artifacts/ai',
     agent: {
       maxSteps: 8,
       timeoutMs: 120000,
