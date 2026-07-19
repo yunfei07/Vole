@@ -178,6 +178,7 @@ export function buildSnapshot(
   }
 
   const snapshotNodes: SnapshotNode[] = [];
+  const staticText: string[] = [];
   const elementIdToXpath: Record<string, string> = {};
   const xpathToElementId: Record<string, string> = {};
   const urlMap: Record<string, string> = {};
@@ -215,12 +216,34 @@ export function buildSnapshot(
         ignoreRoots.add(index);
       }
     }
+    const descendantTextByIndex = collectDescendantText(nodes, strings, ignoreRoots);
     if (options.scopeMarker && scopeRoots.size === 0) {
       continue;
     }
 
     for (let index = 0; index < (nodes.nodeName?.length ?? 0); index += 1) {
-      if (nodes.nodeType?.[index] !== 1) {
+      const nodeType = nodes.nodeType?.[index];
+      if (nodeType === 3) {
+        if (scopeRoots.size > 0 && !isWithin(index, scopeRoots, nodes.parentIndex)) {
+          continue;
+        }
+        if (ignoreRoots.size > 0 && isWithin(index, ignoreRoots, nodes.parentIndex)) {
+          continue;
+        }
+        const bounds = layoutByNode.get(index);
+        const value = stringAt(strings, nodes.nodeValue?.[index]).replace(/\s+/gu, ' ').trim();
+        if (
+          value &&
+          bounds &&
+          bounds[2] > 0 &&
+          bounds[3] > 0 &&
+          !isWithinExcludedTag(index, nodes, strings)
+        ) {
+          staticText.push(`[text frame=${frameOrdinal}] ${limit(value, 500)}`);
+        }
+        continue;
+      }
+      if (nodeType !== 1) {
         continue;
       }
       if (scopeRoots.size > 0 && !isWithin(index, scopeRoots, nodes.parentIndex)) {
@@ -237,11 +260,15 @@ export function buildSnapshot(
       const attributes = attributesByIndex[index] ?? {};
       const axNode = axByBackendId.get(backendNodeId);
       const role = stringValue(axNode?.role);
-      const name = stringValue(axNode?.name) || attributes['aria-label'] || attributes.title;
+      const domText = descendantTextByIndex.get(index);
+      const explicitName = attributes['aria-label'] || attributes.title;
+      const axName = stringValue(axNode?.name);
+      const name = explicitName ||
+        (isContainerElement(tag, role) ? domText || axName : axName || domText);
       const value = isSensitiveInput(tag, attributes)
         ? '[REDACTED]'
         : stringValue(axNode?.value) || attributes.value;
-      const text = stringAt(strings, nodes.nodeValue?.[index]) || name;
+      const text = domText || stringAt(strings, nodes.nodeValue?.[index]) || name;
       const bounds = layoutByNode.get(index);
       const visible = Boolean(bounds && bounds[2] > 0 && bounds[3] > 0 && attributes.hidden === undefined);
       const disabled = attributes.disabled !== undefined || axProperty(axNode, 'disabled') === true;
@@ -254,6 +281,7 @@ export function buildSnapshot(
         text,
         attributes,
         frameUrl: documentUrl,
+        frameOrdinal,
         xpath,
         preferXpath: Boolean(testId && (testIdCounts.get(testId) ?? 0) > 1)
       });
@@ -291,7 +319,7 @@ export function buildSnapshot(
     }
   }
 
-  const serialized = serializeSnapshot(snapshotNodes, options);
+  const serialized = serializeSnapshot(snapshotNodes, staticText, options);
   const fingerprint = createHash('sha256')
     .update(JSON.stringify(snapshotNodes.map((node) => [
       node.tag,
@@ -313,6 +341,45 @@ export function buildSnapshot(
     xpathToElementId,
     urlMap
   };
+}
+
+function collectDescendantText(
+  nodes: NonNullable<DomSnapshotDocument['nodes']>,
+  strings: string[],
+  ignoreRoots: Set<number>
+): Map<number, string> {
+  const pieces = new Map<number, string[]>();
+  for (let index = 0; index < (nodes.nodeType?.length ?? 0); index += 1) {
+    if (
+      nodes.nodeType?.[index] !== 3 ||
+      isWithinExcludedTag(index, nodes, strings) ||
+      isWithin(index, ignoreRoots, nodes.parentIndex)
+    ) {
+      continue;
+    }
+    const text = stringAt(strings, nodes.nodeValue?.[index]).replace(/\s+/gu, ' ').trim();
+    if (!text) {
+      continue;
+    }
+    let current = nodes.parentIndex?.[index] ?? -1;
+    while (current >= 0) {
+      const currentPieces = pieces.get(current) ?? [];
+      currentPieces.push(text);
+      pieces.set(current, currentPieces);
+      current = nodes.parentIndex?.[current] ?? -1;
+    }
+  }
+  return new Map(
+    [...pieces.entries()].map(([index, values]) => [
+      index,
+      limit([...new Set(values)].join(' '), 500)
+    ])
+  );
+}
+
+function isContainerElement(tag: string, role?: string): boolean {
+  return ['article', 'aside', 'body', 'div', 'footer', 'form', 'header', 'html', 'main', 'nav', 'section']
+    .includes(tag) || ['generic', 'group', 'region'].includes(role ?? '');
 }
 
 function isWithin(index: number, roots: Set<number>, parents: number[] | undefined): boolean {
@@ -367,6 +434,7 @@ function buildLocators(input: {
   text?: string;
   attributes: Record<string, string>;
   frameUrl?: string;
+  frameOrdinal?: number;
   xpath?: string;
   preferXpath?: boolean;
 }): LocatorDescriptor[] {
@@ -378,31 +446,55 @@ function buildLocators(input: {
     output.push(locator);
   };
   const frameUrl = input.frameUrl;
+  const frameOrdinal = input.frameOrdinal;
   const testId = input.attributes['data-testid'] ?? input.attributes['data-test-id'];
-  add(input.preferXpath && input.xpath ? { strategy: 'xpath', value: input.xpath, frameUrl } : undefined);
-  add(testId ? { strategy: 'testId', value: testId, frameUrl } : undefined);
-  add(input.role && input.name ? { strategy: 'role', value: input.role, name: input.name, frameUrl } : undefined);
-  add(input.attributes['aria-label'] ? { strategy: 'label', value: input.attributes['aria-label'], frameUrl } : undefined);
-  add(input.attributes.placeholder ? { strategy: 'placeholder', value: input.attributes.placeholder, frameUrl } : undefined);
-  add(input.text && input.text.length <= 120 ? { strategy: 'text', value: input.text, frameUrl } : undefined);
-  add(cssLocator(input.tag, input.attributes, frameUrl));
-  add(!input.preferXpath && input.xpath ? { strategy: 'xpath', value: input.xpath, frameUrl } : undefined);
+  add(input.preferXpath && input.xpath
+    ? { strategy: 'xpath', value: input.xpath, frameUrl, frameOrdinal }
+    : undefined);
+  add(testId ? { strategy: 'testId', value: testId, frameUrl, frameOrdinal } : undefined);
+  add(input.role && input.name
+    ? { strategy: 'role', value: input.role, name: input.name, frameUrl, frameOrdinal }
+    : undefined);
+  add(input.attributes['aria-label']
+    ? { strategy: 'label', value: input.attributes['aria-label'], frameUrl, frameOrdinal }
+    : undefined);
+  add(input.attributes.placeholder
+    ? { strategy: 'placeholder', value: input.attributes.placeholder, frameUrl, frameOrdinal }
+    : undefined);
+  add(input.text && input.text.length <= 120
+    ? { strategy: 'text', value: input.text, frameUrl, frameOrdinal }
+    : undefined);
+  add(cssLocator(input.tag, input.attributes, frameUrl, frameOrdinal));
+  add(!input.preferXpath && input.xpath
+    ? { strategy: 'xpath', value: input.xpath, frameUrl, frameOrdinal }
+    : undefined);
   return output;
 }
 
 function cssLocator(
   tag: string,
   attributes: Record<string, string>,
-  frameUrl?: string
+  frameUrl?: string,
+  frameOrdinal?: number
 ): LocatorDescriptor | undefined {
   if (attributes.id) {
-    return { strategy: 'css', value: `#${cssEscape(attributes.id)}`, frameUrl };
+    return { strategy: 'css', value: `#${cssEscape(attributes.id)}`, frameUrl, frameOrdinal };
   }
   if (attributes.name) {
-    return { strategy: 'css', value: `${tag}[name=${JSON.stringify(attributes.name)}]`, frameUrl };
+    return {
+      strategy: 'css',
+      value: `${tag}[name=${JSON.stringify(attributes.name)}]`,
+      frameUrl,
+      frameOrdinal
+    };
   }
   if (attributes.type && ['input', 'button'].includes(tag)) {
-    return { strategy: 'css', value: `${tag}[type=${JSON.stringify(attributes.type)}]`, frameUrl };
+    return {
+      strategy: 'css',
+      value: `${tag}[type=${JSON.stringify(attributes.type)}]`,
+      frameUrl,
+      frameOrdinal
+    };
   }
   return undefined;
 }
@@ -442,6 +534,7 @@ function absoluteXPath(
 
 function serializeSnapshot(
   nodes: SnapshotNode[],
+  staticText: string[],
   options: { url: string; title: string; maxChars: number; selector?: string }
 ): string {
   const lines = [
@@ -460,12 +553,30 @@ function serializeSnapshot(
         node.attributes['data-testid'] ? `testId=${JSON.stringify(node.attributes['data-testid'])}` : undefined
       ];
       return fields.filter(Boolean).join(' ');
-    })
+    }),
+    ...staticText
   ].filter((line): line is string => Boolean(line));
   const result = lines.join('\n');
   return result.length <= options.maxChars
     ? result
     : `${result.slice(0, options.maxChars)}\n[SNAPSHOT_TRUNCATED]`;
+}
+
+function isWithinExcludedTag(
+  index: number,
+  nodes: NonNullable<DomSnapshotDocument['nodes']>,
+  strings: string[]
+): boolean {
+  const excluded = new Set(['script', 'style', 'noscript', 'template']);
+  let current = nodes.parentIndex?.[index] ?? -1;
+  while (current >= 0) {
+    const tag = stringAt(strings, nodes.nodeName?.[current]).toLowerCase();
+    if (excluded.has(tag)) {
+      return true;
+    }
+    current = nodes.parentIndex?.[current] ?? -1;
+  }
+  return false;
 }
 
 function attributesAt(strings: string[], raw?: number[]): Record<string, string> {

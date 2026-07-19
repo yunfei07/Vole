@@ -1,7 +1,15 @@
+import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Page } from '@playwright/test';
-import { ToolLoopAgent, hasToolCall, stepCountIs, tool as aiTool, type ToolSet } from 'ai';
+import {
+  ToolLoopAgent,
+  hasToolCall,
+  stepCountIs,
+  tool as aiTool,
+  type StepResult,
+  type ToolSet
+} from 'ai';
 import { z } from 'zod';
 import { loadConfig } from '../config/load-config.js';
 import type { VoleConfig } from '../config/schema.js';
@@ -12,12 +20,13 @@ import { AiRuntimeCache, redactVariableValues } from './cache.js';
 import { AiRuntimeError, runtimeError } from './errors.js';
 import {
   RuntimeModelClient,
-  type ModelObjectResult,
-  type ModelMessage,
-  type ModelTool,
-  type ModelToolCall
+  type ModelObjectResult
 } from './model-client.js';
 import { PageSnapshotter } from './snapshot.js';
+import {
+  substituteVariables,
+  variablePromptEntries
+} from './variables.js';
 import type {
   AiActionCandidate,
   AiAction,
@@ -36,6 +45,7 @@ import type {
   AiAssertResult,
   AiExtractOptions,
   AiObserveOptions,
+  AiVariables,
   ExtractSchema,
   LocatorDescriptor,
   PageSnapshot
@@ -68,7 +78,7 @@ const observeResponseSchema = z.object({
 });
 
 const actionPlanSchema = z.object({
-  elementId: z.string().min(1),
+  elementId: z.string().min(1).nullable(),
   method: actionMethodSchema,
   arguments: z.array(z.string()).default([]),
   reasoning: z.string().default(''),
@@ -135,11 +145,16 @@ export class AiRuntime {
       ].join(' '),
       user: {
         instruction,
-        variableNames: Object.keys(options.variables ?? {}),
+        variables: variablePromptEntries(options.variables).map(({ name, description }) => ({
+          placeholder: `%${name}%`,
+          description
+        })),
         snapshot: snapshot.text
       },
       schema: observeResponseSchema,
       timeoutMs: options.timeoutMs,
+      abortSignal: options.abortSignal,
+      providerOptions: options.providerOptions,
       model: options.model
     });
 
@@ -149,10 +164,25 @@ export class AiRuntime {
       if (!node || !locator) {
         return [];
       }
+      const argumentsWithResolvedTargets = candidate.method === 'dragAndDrop' &&
+        candidate.arguments?.[0]
+        ? (() => {
+            const target = snapshot.nodes.find(
+              (item) => item.elementId === candidate.arguments[0]
+            );
+            const targetLocator = target?.locators[0];
+            return targetLocator
+              ? [this.getExecutor().selector(targetLocator), ...candidate.arguments.slice(1)]
+              : undefined;
+          })()
+        : candidate.arguments ?? [];
+      if (!argumentsWithResolvedTargets) {
+        return [];
+      }
       return [{
         ...candidate,
         method: candidate.method as AiActionMethod,
-        arguments: candidate.arguments ?? [],
+        arguments: argumentsWithResolvedTargets,
         locator,
         selector: this.getExecutor().selector(locator)
       }];
@@ -200,8 +230,9 @@ export class AiRuntime {
       return { pageText: snapshot.text };
     }
     const screenshot = options.screenshot
-      ? await this.page.screenshot({ fullPage: false, type: 'jpeg', quality: 70 })
+      ? await this.page.screenshot({ fullPage: false, type: 'png' })
       : undefined;
+    const transformedSchema = transformUrlSchema(schema as z.ZodTypeAny);
     const response = await this.completeObject<unknown>(config, {
       purpose: 'extract',
       system: [
@@ -215,15 +246,22 @@ export class AiRuntime {
         snapshot: snapshot.text,
         urlElementIds: Object.keys(snapshot.urlMap)
       },
-      schema: schema as z.ZodType<unknown>,
+      schema: transformedSchema.schema as z.ZodType<unknown>,
       timeoutMs: options.timeoutMs,
+      abortSignal: options.abortSignal,
+      providerOptions: options.providerOptions,
       model: options.model,
       image: screenshot
-        ? { data: new Uint8Array(screenshot), mediaType: 'image/jpeg' }
+        ? { data: new Uint8Array(screenshot), mediaType: 'image/png' }
         : undefined
     });
     return attachResultMetadata(
-      replaceElementUrls(response.value, snapshot.urlMap, snapshot.url),
+      restoreUrlFields(
+        response.value,
+        transformedSchema.urlPaths,
+        snapshot.urlMap,
+        snapshot.url
+      ),
       response.usage
     ) as T;
   }
@@ -236,14 +274,17 @@ export class AiRuntime {
     options: AiActOptions = {}
   ): Promise<AiActResult> {
     if (isAiAction(rawInput)) {
-      return this.replayAction(rawInput, options);
+      return this.replayActionWithHealing(rawInput, options);
     }
     const input: AiActInput = typeof rawInput === 'string'
       ? {
           instruction: rawInput,
           variables: options.variables,
           timeoutMs: options.timeoutMs,
-          model: options.model
+          model: options.model,
+          cache: options.cache,
+          abortSignal: options.abortSignal,
+          providerOptions: options.providerOptions
         }
       : rawInput;
     const config = await this.config();
@@ -251,6 +292,7 @@ export class AiRuntime {
     const firstSnapshot = await this.snapshot();
     const cache = this.getCache(config);
     const cacheInstruction = redactVariableValues(input.instruction, input.variables);
+    const useCache = input.cache ?? options.cache ?? true;
     const key = cache.createKey({
       instruction: input.instruction,
       url: firstSnapshot.url,
@@ -258,7 +300,7 @@ export class AiRuntime {
       model: input.model ?? config.runtimeAi.model ?? config.ai.model,
       variables: input.variables
     });
-    const cached = await cache.get(key);
+    const cached = useCache ? await cache.get(key) : undefined;
 
     if (
       cached &&
@@ -279,11 +321,17 @@ export class AiRuntime {
         for (const [index, cachedAction] of cachedActions.entries()) {
           await this.getExecutor().execute({
             method: cachedAction.method ?? cached.action,
-            locator: this.getExecutor().descriptorFromSelector(cachedAction.selector),
-            value: input.value ?? cachedAction.arguments?.[0],
+            locator: cachedAction.locator ??
+              this.getExecutor().descriptorFromSelector(cachedAction.selector),
+            value: substituteVariables(
+              input.value ?? cachedAction.arguments?.[0] ?? '',
+              input.variables
+            ),
             filePath: input.filePath,
             targetLocator: cachedAction.method === 'dragAndDrop' && cachedAction.arguments?.[0]
-              ? this.getExecutor().descriptorFromSelector(cachedAction.arguments[0])
+              ? this.getExecutor().descriptorFromSelector(
+                  substituteVariables(cachedAction.arguments[0], input.variables)
+                )
               : undefined,
             timeoutMs
           });
@@ -311,17 +359,19 @@ export class AiRuntime {
 
     try {
       const result = await this.planAndExecute(input, firstSnapshot, timeoutMs);
-      await cache.set({
-        key,
-        instruction: cacheInstruction,
-        url: firstSnapshot.url,
-        pageFingerprint: firstSnapshot.fingerprint,
-        model: input.model ?? config.runtimeAi.model ?? config.ai.model,
-        variableNames: Object.keys(input.variables ?? {}).sort(),
-        action: result.action!,
-        locator: result.locator!,
-        actions: transformActionVariables(result.actions, input.variables, 'template')
-      }).catch(() => undefined);
+      if (useCache && result.success && result.action && result.locator) {
+        await cache.set({
+          key,
+          instruction: cacheInstruction,
+          url: firstSnapshot.url,
+          pageFingerprint: firstSnapshot.fingerprint,
+          model: input.model ?? config.runtimeAi.model ?? config.ai.model,
+          variableNames: Object.keys(input.variables ?? {}).sort(),
+          action: result.action,
+          locator: result.locator,
+          actions: transformActionVariables(result.actions, input.variables, 'template')
+        }).catch(() => undefined);
+      }
       await this.tryArtifact('act', { input, result });
       return result;
     } catch (firstError) {
@@ -332,17 +382,19 @@ export class AiRuntime {
         const freshSnapshot = await this.snapshot();
         const result = await this.planAndExecute(input, freshSnapshot, timeoutMs);
         const healed = { ...result, selfHealed: true };
-        await cache.set({
-          key,
-          instruction: cacheInstruction,
-          url: freshSnapshot.url,
-          pageFingerprint: freshSnapshot.fingerprint,
-          model: input.model ?? config.runtimeAi.model ?? config.ai.model,
-          variableNames: Object.keys(input.variables ?? {}).sort(),
-          action: healed.action!,
-          locator: healed.locator!,
-          actions: transformActionVariables(healed.actions, input.variables, 'template')
-        }).catch(() => undefined);
+        if (useCache && healed.success && healed.action && healed.locator) {
+          await cache.set({
+            key,
+            instruction: cacheInstruction,
+            url: freshSnapshot.url,
+            pageFingerprint: freshSnapshot.fingerprint,
+            model: input.model ?? config.runtimeAi.model ?? config.ai.model,
+            variableNames: Object.keys(input.variables ?? {}).sort(),
+            action: healed.action,
+            locator: healed.locator,
+            actions: transformActionVariables(healed.actions, input.variables, 'template')
+          }).catch(() => undefined);
+        }
         await this.tryArtifact('act', { input, result: healed });
         return healed;
       } catch (secondError) {
@@ -356,11 +408,17 @@ export class AiRuntime {
   async assert(input: AiAssertInput): Promise<AiAssertResult> {
     const candidates = await this.observe(input.instruction, {
       timeoutMs: input.timeoutMs,
-      variables: input.variables
+      variables: input.variables,
+      model: input.model,
+      abortSignal: input.abortSignal,
+      providerOptions: input.providerOptions
     });
     const candidate = candidates[0];
     const extracted = await this.extract(input.instruction, assertExtractSchema, {
       timeoutMs: input.timeoutMs,
+      model: input.model,
+      abortSignal: input.abortSignal,
+      providerOptions: input.providerOptions,
       context: candidate
         ? `Observed candidate: ${candidate.description}; locator strategy=${candidate.locator.strategy}`
         : 'No matching element was observed; evaluate page-level evidence only.'
@@ -407,16 +465,19 @@ export class AiRuntime {
         break;
       case 'semantic': {
         const config = await this.config();
-        const judgement = await this.getModel(config).completeJson({
+        const judgement = await this.completeObject<z.infer<typeof semanticJudgeSchema>>(config, {
           purpose: 'assert',
           system: 'Judge whether the browser facts satisfy the assertion. Do not infer missing evidence.',
           user: { assertion: input.instruction, expected: input.expected, facts },
           schema: semanticJudgeSchema,
-          timeoutMs: input.timeoutMs
+          timeoutMs: input.timeoutMs,
+          abortSignal: input.abortSignal,
+          providerOptions: input.providerOptions,
+          model: input.model
         });
-        passed = judgement.passed;
-        reason = judgement.reason;
-        evidence = [...evidence, ...(judgement.evidence ?? [])];
+        passed = judgement.value.passed;
+        reason = judgement.value.reason;
+        evidence = [...evidence, ...(judgement.value.evidence ?? [])];
         break;
       }
     }
@@ -472,164 +533,13 @@ export class AiRuntime {
   private async runAgent(input: AiAgentInput, agentConfig: AiAgentConfig): Promise<AiAgentResult> {
     const config = await this.config();
     const model = this.getModel(config);
-    return model.getLanguageModel
-      ? this.runSdkAgent(input, agentConfig, config, model as RuntimeModelClient)
-      : this.runLegacyAgent(input);
-  }
-
-  private async runLegacyAgent(input: AiAgentInput): Promise<AiAgentResult> {
-    const config = await this.config();
-    const maxSteps = input.maxSteps ?? config.runtimeAi.agent.maxSteps;
-    const totalTimeoutMs = input.timeoutMs ?? config.runtimeAi.agent.timeoutMs;
-    const deadline = Date.now() + totalTimeoutMs;
-    const history: AiAgentHistoryItem[] = [];
-    const messages: ModelMessage[] = [
-      {
-        role: 'system',
-        content: [
-          'You are a bounded browser automation agent operating an existing Playwright page.',
-          'Use the supplied tools only. Begin by observing when the target is not certain.',
-          'Never claim success without verifying the final state.',
-          'Call done exactly once when the goal is complete or impossible.'
-        ].join(' ')
-      },
-      {
-        role: 'user',
-        content: JSON.stringify({
-          goal: input.instruction,
-          variableNames: Object.keys(input.variables ?? {}),
-          currentUrl: this.page.url()
-        })
-      }
-    ];
-
-    for (let step = 1; step <= maxSteps; step += 1) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw runtimeError('AI_AGENT_FAILED', `agent exceeded total timeout of ${totalTimeoutMs}ms`, { history });
-      }
-      const decisionSnapshot = await this.snapshot();
-      const cache = this.getCache(config);
-      const decisionKey = cache.createKey({
-        instruction: [
-          'agent-decision',
-          input.instruction,
-          `step=${step}`,
-          `history=${history.map((item) => item.tool).join(',')}`
-        ].join('\n'),
-        url: decisionSnapshot.url,
-        pageFingerprint: decisionSnapshot.fingerprint,
-        model: config.runtimeAi.model ?? config.ai.model,
-        variables: input.variables
-      });
-      const cachedDecision = await cache.getAgentDecision(decisionKey);
-      const response = cachedDecision
-        ? {
-            content: null,
-            toolCalls: transformToolCallVariables(
-              cachedDecision.toolCalls,
-              input.variables,
-              'hydrate'
-            )
-          }
-        : await this.getModel(config).completeWithTools(
-            messages,
-            agentTools,
-            Math.min(remaining, config.runtimeAi.agent.toolTimeoutMs)
-          );
-      const decisionFromCache = Boolean(cachedDecision);
-      messages.push({
-        role: 'assistant',
-        content: response.content,
-        tool_calls: response.toolCalls
-      });
-
-      if (response.toolCalls.length === 0) {
-        throw runtimeError(
-          'AI_MODEL_CAPABILITY_UNSUPPORTED',
-          'agent model returned text without calling a tool'
-        );
-      }
-
-      for (const call of response.toolCalls) {
-        const toolInput = parseToolArguments(call);
-        let output: unknown;
-        try {
-          output = call.function.name === 'done' &&
-            Boolean(toolInput.success) &&
-            !hasVerificationAfterLastMutation(history)
-            ? { success: false, message: 'Agent must verify the final state before reporting success' }
-            : await withTimeout(
-                this.executeAgentTool(call.function.name, toolInput, input, config),
-                Math.min(deadline - Date.now(), config.runtimeAi.agent.toolTimeoutMs),
-                call.function.name
-              );
-        } catch (error) {
-          if (!decisionFromCache) {
-            throw error;
-          }
-          await cache.deleteAgentDecision(decisionKey);
-          output = {
-            cachedDecisionFailed: true,
-            error: error instanceof Error ? error.message : String(error)
-          };
-        }
-        history.push({ step, tool: call.function.name, input: safeValue(toolInput), output });
-        messages.push({
-          role: 'tool',
-          tool_call_id: call.id,
-          content: JSON.stringify(output)
-        });
-        const failedDone = call.function.name === 'done' &&
-          output &&
-          typeof output === 'object' &&
-          'success' in output &&
-          output.success === false;
-        if (!decisionFromCache && response.toolCalls.length === 1 && !failedDone) {
-          await cache.setAgentDecision({
-            key: decisionKey,
-            toolCalls: transformToolCallVariables(
-              response.toolCalls,
-              input.variables,
-              'template'
-            )
-          }).catch(() => undefined);
-        }
-
-        if (
-          output &&
-          typeof output === 'object' &&
-          'cachedDecisionFailed' in output
-        ) {
-          break;
-        }
-
-        if (call.function.name === 'done') {
-          const done = output as { success: boolean; message: string };
-          if (!done.success) {
-            const artifactPath = await this.tryArtifact('agent-failed', { input, history, message: done.message });
-            throw runtimeError('AI_AGENT_FAILED', `${done.message}; artifact=${artifactPath}`, { history });
-          }
-          const result: AiAgentResult = {
-            success: true,
-            message: done.message,
-            steps: step,
-            history,
-            actions: history,
-            completed: true
-          };
-          await this.tryArtifact('agent', { input, result });
-          return result;
-        }
-      }
+    if (!model.getLanguageModel) {
+      throw runtimeError(
+        'AI_MODEL_CAPABILITY_UNSUPPORTED',
+        'DOM Agent requires an AI SDK v7 language model with tool calling'
+      );
     }
-
-    const artifactPath = await this.tryArtifact('agent-failed', { input, history, reason: 'max steps reached' });
-    throw runtimeError(
-      'AI_AGENT_FAILED',
-      `agent reached maximum steps (${maxSteps}); artifact=${artifactPath}`,
-      { history }
-    );
+    return this.runSdkAgent(input, agentConfig, config, model as RuntimeModelClient);
   }
 
   private async runSdkAgent(
@@ -644,34 +554,65 @@ export class AiRuntime {
     const cache = this.getCache(config);
     const initialSnapshot = await this.snapshot();
     const modelName = agentConfig.model ?? config.runtimeAi.model ?? config.ai.model;
-    const configSignature = JSON.stringify({
-      mode: 'dom',
-      model: modelName,
-      executionModel: agentConfig.executionModel,
-      maxSteps,
-      customTools: Object.keys(agentConfig.tools ?? {}).sort(),
-      sameOriginOnly: config.runtimeAi.agent.sameOriginOnly
-    });
-    const cacheKey = cache.createKey({
-      instruction: `agent-trajectory\n${input.instruction}\n${configSignature}`,
+    const configSignature = createHash('sha256')
+      .update(JSON.stringify({
+        mode: 'dom',
+        model: modelName,
+        executionModel: agentConfig.executionModel,
+        maxSteps,
+        customTools: Object.keys(agentConfig.tools ?? {}).sort(),
+        excludeTools: [...(agentConfig.excludeTools ?? [])].sort(),
+        systemPrompt: agentConfig.systemPrompt,
+        providerOptions: input.providerOptions,
+        variableDescriptions: variablePromptEntries(input.variables),
+        sameOriginOnly: config.runtimeAi.agent.sameOriginOnly
+      }))
+      .digest('hex');
+    const cacheEligible = !agentConfig.tools &&
+      !input.messages?.length &&
+      input.output === undefined;
+    const cacheKey = cache.createAgentKey({
+      instruction: input.instruction,
       url: initialSnapshot.url,
-      pageFingerprint: initialSnapshot.fingerprint,
       model: modelName,
+      configSignature,
       variables: input.variables
     });
-    if (!agentConfig.tools) {
+    if (cacheEligible) {
       const cached = await cache.getAgentTrajectory(cacheKey);
       if (cached) {
         try {
-          const replayed = await this.replayTrajectory(cached.history, input, config);
+          const replayed = await this.replayTrajectory(
+            cached.history,
+            input,
+            config,
+            agentConfig.executionModel
+          );
           const result: AiAgentResult = {
             success: true,
             message: cached.resultMessage,
             steps: replayed.length,
             history: replayed,
             actions: replayed,
-            completed: true
+            completed: true,
+            cacheStatus: 'HIT',
+            selfHealed: replayed.some((item) =>
+              item.output &&
+              typeof item.output === 'object' &&
+              (item.output as Record<string, unknown>).selfHealed === true
+            )
           };
+          await cache.setAgentTrajectory({
+            key: cacheKey,
+            instruction: redactVariableValues(input.instruction, input.variables),
+            url: initialSnapshot.url,
+            model: modelName,
+            configSignature,
+            variableNames: Object.keys(input.variables ?? {}).sort(),
+            history: transformHistoryVariables(replayed, input.variables, 'template'),
+            resultMessage: cached.resultMessage
+          }).catch(() => undefined);
+          await input.callbacks?.onEvidence?.({ type: 'final', data: result });
           await input.callbacks?.onFinish?.(result);
           return result;
         } catch {
@@ -680,32 +621,47 @@ export class AiRuntime {
       }
     }
 
-    const tools = this.createSdkAgentTools(input, config, history, agentConfig.tools);
+    const tools = this.createSdkAgentTools(
+      input,
+      config,
+      history,
+      agentConfig.tools,
+      agentConfig.executionModel,
+      agentConfig.excludeTools
+    );
     const loop = new ToolLoopAgent({
       model: model.getLanguageModel(modelName),
       instructions: agentConfig.systemPrompt ?? agentSystemPrompt(),
       tools,
       stopWhen: [hasToolCall('done'), stepCountIs(maxSteps)],
-      prepareStep: input.callbacks?.prepareStep
+      prepareStep: input.callbacks?.prepareStep,
+      onStepFinish: (event) => this.handleAgentStep(input, event),
+      providerOptions: input.providerOptions
     });
 
     try {
       const generated = await loop.generate({
-        ...(input.messages?.length
-          ? { messages: input.messages }
-          : { prompt: agentPrompt(input, this.page.url()) }),
+        ...agentCallPrompt(input, this.page.url()),
         abortSignal: input.abortSignal,
         timeout: input.timeoutMs ?? config.runtimeAi.agent.timeoutMs
       });
       let done = lastDone(history);
       if (!done) {
-        const forcedTools = this.createSdkAgentTools(input, config, history);
+        const forcedTools = this.createSdkAgentTools(
+          input,
+          config,
+          history,
+          undefined,
+          agentConfig.executionModel,
+          agentConfig.excludeTools
+        );
         const finalizer = new ToolLoopAgent({
           model: model.getLanguageModel(modelName),
           instructions: 'Call done once. Report success only when the supplied history proves the goal.',
           tools: { done: forcedTools.done },
           toolChoice: { type: 'tool', toolName: 'done' },
-          stopWhen: hasToolCall('done')
+          stopWhen: hasToolCall('done'),
+          providerOptions: input.providerOptions
         });
         await finalizer.generate({
           prompt: JSON.stringify({
@@ -728,16 +684,7 @@ export class AiRuntime {
         );
       }
 
-      const output = input.output
-        ? (await this.completeObject<Record<string, unknown>>(config, {
-            purpose: 'agent-output',
-            system: 'Extract the requested final output from verified agent history. Do not invent values.',
-            user: { goal: input.instruction, history: safeValue(history) },
-            schema: input.output,
-            timeoutMs: input.timeoutMs,
-            model: modelName
-          })).value
-        : undefined;
+      const output = done.output;
       const result: AiAgentResult = {
         success: true,
         message: done.message,
@@ -749,10 +696,18 @@ export class AiRuntime {
           ...toRuntimeUsage(generated.usage),
           inferenceTimeMs: Date.now() - startedAt
         },
-        messages: generated.responseMessages as typeof input.messages,
-        output
+        messages: [
+          ...(input.messages ?? []),
+          ...(input.messages?.length
+            ? [{ role: 'user' as const, content: input.instruction }]
+            : []),
+          ...generated.responseMessages
+        ],
+        output,
+        cacheStatus: 'MISS',
+        selfHealed: false
       };
-      if (!agentConfig.tools) {
+      if (cacheEligible) {
         await cache.setAgentTrajectory({
           key: cacheKey,
           instruction: redactVariableValues(input.instruction, input.variables),
@@ -770,127 +725,218 @@ export class AiRuntime {
       return result;
     } catch (error) {
       const mapped = error instanceof Error ? error : new Error(String(error));
+      const terminalError = normalizeAgentError(mapped, history);
       if (input.abortSignal?.aborted) {
         await input.callbacks?.onAbort?.();
       } else {
-        await input.callbacks?.onError?.(mapped);
+        await input.callbacks?.onError?.(terminalError);
       }
       const artifactPath = await this.tryArtifact('agent-failed', {
         input,
         history,
-        error: mapped.message
+        error: terminalError.message
       });
-      throw runtimeError('AI_AGENT_FAILED', `${mapped.message}; artifact=${artifactPath}`, { history });
+      if (terminalError instanceof AiRuntimeError && terminalError.code !== 'AI_AGENT_FAILED') {
+        throw terminalError;
+      }
+      throw runtimeError(
+        'AI_AGENT_FAILED',
+        `${terminalError.message}; artifact=${artifactPath}`,
+        { history }
+      );
     }
   }
 
   private async streamAgent(
     input: AiAgentInput,
     agentConfig: AiAgentConfig
-  ): Promise<{ textStream: AsyncIterable<string>; result: Promise<AiAgentResult> }> {
+  ): Promise<
+    Awaited<ReturnType<ToolLoopAgent<never, ToolSet>['stream']>> & {
+      result: Promise<AiAgentResult>;
+    }
+  > {
     const config = await this.config();
     const model = this.getModel(config);
     if (!model.getLanguageModel) {
-      const result = this.runLegacyAgent(input);
-      return {
-        textStream: (async function* () {
-          yield (await result).message;
-        })(),
-        result
-      };
+      throw runtimeError(
+        'AI_MODEL_CAPABILITY_UNSUPPORTED',
+        'streaming DOM Agent requires an AI SDK v7 language model with tool calling'
+      );
     }
     const history: AiAgentHistoryItem[] = [];
     const modelName = agentConfig.model ?? config.runtimeAi.model ?? config.ai.model;
+    const maxSteps = input.maxSteps ?? config.runtimeAi.agent.maxSteps;
     const startedAt = Date.now();
-    const tools = this.createSdkAgentTools(input, config, history, agentConfig.tools);
+    const tools = this.createSdkAgentTools(
+      input,
+      config,
+      history,
+      agentConfig.tools,
+      agentConfig.executionModel,
+      agentConfig.excludeTools
+    );
     const loop = new ToolLoopAgent({
       model: model.getLanguageModel(modelName),
       instructions: agentConfig.systemPrompt ?? agentSystemPrompt(),
       tools,
       stopWhen: [
         hasToolCall('done'),
-        stepCountIs(input.maxSteps ?? config.runtimeAi.agent.maxSteps)
+        stepCountIs(maxSteps)
       ],
-      prepareStep: input.callbacks?.prepareStep
+      prepareStep: input.callbacks?.prepareStep,
+      onStepFinish: (event) => this.handleAgentStep(input, event),
+      providerOptions: input.providerOptions
     });
-    const streamed = await loop.stream({
-      ...(input.messages?.length
-        ? { messages: input.messages }
-        : { prompt: agentPrompt(input, this.page.url()) }),
-      abortSignal: input.abortSignal,
-      timeout: input.timeoutMs ?? config.runtimeAi.agent.timeoutMs
-    });
-    const textStream = this.withChunkCallback(streamed.textStream, input);
+    let streamed: Awaited<ReturnType<typeof loop.stream>>;
+    try {
+      streamed = await loop.stream({
+        ...agentCallPrompt(input, this.page.url()),
+        abortSignal: input.abortSignal,
+        timeout: input.timeoutMs ?? config.runtimeAi.agent.timeoutMs
+      });
+    } catch (error) {
+      const mapped = error instanceof Error ? error : new Error(String(error));
+      const terminalError = normalizeAgentError(mapped, history);
+      if (input.abortSignal?.aborted) {
+        await input.callbacks?.onAbort?.();
+      } else {
+        await input.callbacks?.onError?.(terminalError);
+      }
+      throw terminalError;
+    }
     const result = (async (): Promise<AiAgentResult> => {
-      const [usage, responseMessages] = await Promise.all([
-        streamed.usage,
-        streamed.responseMessages
-      ]);
-      let done = lastDone(history);
-      if (!done) {
-        const forcedTools = this.createSdkAgentTools(input, config, history);
-        const finalizer = new ToolLoopAgent({
-          model: model.getLanguageModel!(modelName),
-          instructions: 'Call done once based only on the verified streaming agent history.',
-          tools: { done: forcedTools.done },
-          toolChoice: { type: 'tool', toolName: 'done' },
-          stopWhen: hasToolCall('done')
-        });
-        await finalizer.generate({
-          prompt: JSON.stringify({ goal: input.instruction, history: safeValue(history) }),
-          abortSignal: input.abortSignal,
-          timeout: config.runtimeAi.agent.toolTimeoutMs
-        });
-        done = lastDone(history);
+      try {
+        const [usage, responseMessages] = await Promise.all([
+          streamed.usage,
+          streamed.responseMessages
+        ]);
+        let done = lastDone(history);
+        if (!done) {
+          const forcedTools = this.createSdkAgentTools(
+            input,
+            config,
+            history,
+            undefined,
+            agentConfig.executionModel,
+            agentConfig.excludeTools
+          );
+          const finalizer = new ToolLoopAgent({
+            model: model.getLanguageModel!(modelName),
+            instructions: 'Call done once based only on the verified streaming agent history.',
+            tools: { done: forcedTools.done },
+            toolChoice: { type: 'tool', toolName: 'done' },
+            stopWhen: hasToolCall('done'),
+            providerOptions: input.providerOptions
+          });
+          await finalizer.generate({
+            prompt: JSON.stringify({ goal: input.instruction, history: safeValue(history) }),
+            abortSignal: input.abortSignal,
+            timeout: config.runtimeAi.agent.toolTimeoutMs
+          });
+          done = lastDone(history);
+        }
+        if (!done?.success) {
+          throw runtimeError(
+            'AI_AGENT_FAILED',
+            done?.message ?? 'streaming agent did not complete',
+            { history }
+          );
+        }
+        const output = done.output;
+        const value: AiAgentResult = {
+          success: true,
+          message: done.message,
+          steps: history.length,
+          history,
+          actions: history,
+          completed: true,
+          usage: {
+            ...toRuntimeUsage(usage),
+            inferenceTimeMs: Date.now() - startedAt
+          },
+          messages: [
+            ...(input.messages ?? []),
+            ...(input.messages?.length
+              ? [{ role: 'user' as const, content: input.instruction }]
+              : []),
+            ...responseMessages
+          ],
+          output,
+          cacheStatus: 'MISS',
+          selfHealed: false
+        };
+        await input.callbacks?.onEvidence?.({ type: 'final', data: value });
+        await input.callbacks?.onFinish?.(value);
+        return value;
+      } catch (error) {
+        const mapped = error instanceof Error ? error : new Error(String(error));
+        const terminalError = normalizeAgentError(mapped, history);
+        if (input.abortSignal?.aborted) {
+          await input.callbacks?.onAbort?.();
+        } else {
+          await input.callbacks?.onError?.(terminalError);
+        }
+        throw terminalError;
       }
-      if (!done?.success) {
-        throw runtimeError('AI_AGENT_FAILED', done?.message ?? 'streaming agent did not complete', { history });
-      }
-      const output = input.output
-        ? (await this.completeObject<Record<string, unknown>>(config, {
-            purpose: 'agent-stream-output',
-            system: 'Extract the requested final output from verified agent history.',
-            user: { goal: input.instruction, history: safeValue(history) },
-            schema: input.output,
-            timeoutMs: input.timeoutMs,
-            model: modelName
-          })).value
-        : undefined;
-      const value: AiAgentResult = {
-        success: true,
-        message: done.message,
-        steps: history.length,
-        history,
-        actions: history,
-        completed: true,
-        usage: {
-          ...toRuntimeUsage(usage),
-          inferenceTimeMs: Date.now() - startedAt
-        },
-        messages: responseMessages as typeof input.messages,
-        output
-      };
-      await input.callbacks?.onFinish?.(value);
-      return value;
     })();
-    return { textStream, result };
+    const textStream = this.withChunkCallback(
+      streamed.textStream,
+      input
+    ) as typeof streamed.textStream;
+    return new Proxy(streamed, {
+      get(target, property) {
+        if (property === 'textStream') {
+          return textStream;
+        }
+        if (property === 'result') {
+          return result;
+        }
+        return Reflect.get(target, property, target);
+      }
+    }) as typeof streamed & { result: Promise<AiAgentResult> };
   }
 
   private createSdkAgentTools(
     agentInput: AiAgentInput,
     config: VoleConfig,
     history: AiAgentHistoryItem[],
-    customTools?: ToolSet
+    customTools?: ToolSet,
+    executionModel?: string,
+    excludeTools: string[] = []
   ): ToolSet {
+    const recordResult = async (
+      name: string,
+      toolInput: unknown,
+      output: unknown
+    ): Promise<unknown> => {
+      const item: AiAgentHistoryItem = {
+        step: history.length + 1,
+        tool: name,
+        input: safeValue(toolInput),
+        output: safeValue(output)
+      };
+      history.push(item);
+      await agentInput.callbacks?.onToolFinish?.(item);
+      await agentInput.callbacks?.onEvidence?.({
+        type: name === 'screenshot'
+          ? 'screenshot'
+          : verificationTool(name)
+            ? 'observation'
+            : 'action',
+        step: item.step,
+        data: item
+      });
+      return output;
+    };
     const execute = async (name: string, input: Record<string, unknown>): Promise<unknown> => {
       let output: unknown;
       try {
         output = name === 'done' &&
-          Boolean(input.success) &&
+          Boolean(input.success ?? input.taskComplete) &&
           !hasVerificationAfterLastMutation(history)
           ? { success: false, message: 'Agent must verify the final state before reporting success' }
           : await withTimeout(
-              this.executeAgentTool(name, input, agentInput, config),
+              this.executeAgentTool(name, input, agentInput, config, executionModel),
               config.runtimeAi.agent.toolTimeoutMs,
               name
             );
@@ -903,65 +949,90 @@ export class AiRuntime {
           error: error instanceof Error ? error.message : String(error)
         };
       }
-      const item: AiAgentHistoryItem = {
-        step: history.length + 1,
-        tool: name,
-        input: safeValue(input),
-        output: safeValue(output)
-      };
-      history.push(item);
-      await agentInput.callbacks?.onStepFinish?.(item);
-      await agentInput.callbacks?.onEvidence?.({
-        type: name === 'screenshot'
-          ? 'screenshot'
-          : verificationTool(name)
-            ? 'observation'
-            : 'action',
-        step: item.step,
-        data: item
-      });
-      return output;
+      return recordResult(name, input, output);
     };
+    const wrappedCustomTools = Object.fromEntries(
+      Object.entries(customTools ?? {}).map(([name, customTool]) => {
+        const candidate = customTool as {
+          execute?: (input: unknown, options: unknown) => unknown | PromiseLike<unknown>;
+        };
+        if (typeof candidate.execute !== 'function') {
+          return [name, customTool];
+        }
+        const originalExecute = candidate.execute.bind(customTool);
+        return [name, {
+          ...customTool,
+          execute: async (toolInput: unknown, toolOptions: unknown) => {
+            let output: unknown;
+            try {
+              output = await withTimeout(
+                Promise.resolve(originalExecute(toolInput, toolOptions)),
+                config.runtimeAi.agent.toolTimeoutMs,
+                name
+              );
+            } catch (error) {
+              if (shouldTerminateAgentTool(error)) {
+                throw error;
+              }
+              output = {
+                success: false,
+                error: error instanceof Error ? error.message : String(error)
+              };
+            }
+            return recordResult(name, toolInput, output);
+          }
+        }];
+      })
+    ) as ToolSet;
+    const doneOutputSchema = agentInput.output ?? z.record(z.unknown());
     const tools: ToolSet = {
-      observe: aiTool({
-        description: 'Find relevant actionable elements on the current page',
-        inputSchema: z.object({ instruction: z.string().min(1) }),
-        execute: (input) => execute('observe', input)
-      }),
       ariaTree: aiTool({
         description: 'Read the current page DOM/accessibility tree',
         inputSchema: z.object({}),
-        execute: (input) => execute('ariaTree', input)
+        execute: (input) => execute('ariaTree', input),
+        toModelOutput: ({ output }) => {
+          const result = output as {
+            success?: boolean;
+            content?: string;
+            error?: string;
+            pageUrl?: string;
+          };
+          return {
+            type: 'content' as const,
+            value: [{
+              type: 'text' as const,
+              text: result.success && result.content
+                ? `${result.content}\npageUrl=${result.pageUrl ?? ''}`
+                : JSON.stringify(result)
+            }]
+          };
+        }
       }),
       act: aiTool({
-        description: 'Perform one grounded browser action',
+        description: 'Perform a semantic browser action such as clicking or typing',
         inputSchema: z.object({
-          instruction: z.string().min(1),
-          action: actionMethodSchema.optional(),
-          target: z.string().optional(),
-          value: z.string().optional()
+          action: z.string().min(1).describe(
+            'A short action such as "click Login" or "type %email% into the email input"'
+          )
         }),
         execute: (input) => execute('act', input)
       }),
-      assert: aiTool({
-        description: 'Verify browser state using deterministic and semantic evidence',
+      extract: aiTool({
+        description: 'Extract structured facts from the page using an optional JSON Schema',
         inputSchema: z.object({
           instruction: z.string().min(1),
-          kind: z.enum(['visible', 'hidden', 'text', 'containsText', 'enabled', 'disabled', 'semantic']),
-          target: z.string().optional(),
-          expected: z.string().optional()
+          schema: z.record(z.unknown()).optional()
         }),
-        execute: (input) => execute('assert', input)
-      }),
-      extract: aiTool({
-        description: 'Extract concise structured facts from the page',
-        inputSchema: z.object({ instruction: z.string().min(1) }),
         execute: (input) => execute('extract', input)
       }),
       fillForm: aiTool({
         description: 'Fill several form fields',
         inputSchema: z.object({
-          fields: z.array(z.object({ target: z.string().min(1), value: z.string() }))
+          fields: z.array(z.object({
+            action: z.string().min(1).describe(
+              'For example: "type %email% into the email input"'
+            )
+          })).min(1)
         }),
         execute: (input) => execute('fillForm', input)
       }),
@@ -971,71 +1042,190 @@ export class AiRuntime {
         execute: (input) => execute('goto', input)
       }),
       keys: aiTool({
-        description: 'Press a keyboard key or chord',
-        inputSchema: z.object({ key: z.string().min(1) }),
+        description: 'Type text or press keys in the currently focused element',
+        inputSchema: z.object({
+          method: z.enum(['press', 'type']),
+          value: z.string().min(1),
+          repeat: z.number().int().positive().optional()
+        }),
         execute: (input) => execute('keys', input)
       }),
-      navBack: aiTool({
+      navback: aiTool({
         description: 'Navigate back one page',
-        inputSchema: z.object({}),
-        execute: (input) => execute('navBack', input)
+        inputSchema: z.object({ reasoningText: z.string().optional() }),
+        execute: (input) => execute('navback', input)
       }),
       screenshot: aiTool({
         description: 'Capture viewport evidence',
         inputSchema: z.object({}),
-        execute: (input) => execute('screenshot', input)
-      }),
+        execute: (input) => execute('screenshot', input),
+        toModelOutput: ({ output }) => {
+          const result = output as {
+            success?: boolean;
+            error?: string;
+            base64?: string;
+          };
+          if (!result.success || result.error || !result.base64) {
+            return {
+              type: 'content' as const,
+              value: [{ type: 'text' as const, text: JSON.stringify(result) }]
+            };
+          }
+          return {
+            type: 'content' as const,
+            value: [{
+              type: 'media' as const,
+              mediaType: 'image/png',
+              data: result.base64
+            }]
+          };
+        }
+      } as Parameters<typeof aiTool<{}, unknown, Record<string, unknown>>>[0]),
       scroll: aiTool({
-        description: 'Scroll the current page',
+        description: 'Scroll up or down by a percentage of the viewport',
         inputSchema: z.object({
           direction: z.enum(['up', 'down']),
-          amount: z.number().positive().max(5000).optional()
+          percentage: z.number().min(1).max(200).optional()
         }),
         execute: (input) => execute('scroll', input)
       }),
       think: aiTool({
         description: 'Record a concise plan without changing the page',
-        inputSchema: z.object({ thought: z.string().min(1) }),
+        inputSchema: z.object({ reasoning: z.string().min(1) }),
         execute: (input) => execute('think', input)
       }),
       wait: aiTool({
         description: 'Wait briefly for asynchronous UI updates',
-        inputSchema: z.object({ ms: z.number().int().positive().max(10000) }),
+        inputSchema: z.object({ timeMs: z.number().int().min(0).max(10000) }),
         execute: (input) => execute('wait', input)
       }),
       done: aiTool({
         description: 'Finish only after the final state was verified',
-        inputSchema: z.object({ success: z.boolean(), message: z.string().min(1) }),
+        inputSchema: z.object({
+          success: z.boolean().optional(),
+          taskComplete: z.boolean().optional(),
+          message: z.string().optional(),
+          reasoning: z.string().optional(),
+          output: doneOutputSchema.optional()
+        }),
         execute: (input) => execute('done', input)
       }),
-      ...customTools
+      ...wrappedCustomTools
     };
-    return tools;
+    return Object.fromEntries(
+      Object.entries(tools).filter(([name]) =>
+        customTools?.[name] !== undefined || !excludeTools.includes(name)
+      )
+    );
   }
 
   private async replayTrajectory(
     cachedHistory: AiAgentHistoryItem[],
     input: AiAgentInput,
-    config: VoleConfig
+    config: VoleConfig,
+    executionModel?: string
   ): Promise<AiAgentHistoryItem[]> {
     const history: AiAgentHistoryItem[] = [];
     for (const item of transformHistoryVariables(cachedHistory, input.variables, 'hydrate')) {
-      if (item.tool === 'done') {
+      if (['done', 'think', 'screenshot'].includes(item.tool)) {
         continue;
       }
       const toolInput = z.record(z.unknown()).parse(item.input);
-      const output = await this.executeAgentTool(item.tool, toolInput, input, config);
-      history.push({
+      let output: unknown;
+      if (item.tool === 'act') {
+        output = await this.replayCachedAgentAction(item, toolInput, input, config, executionModel);
+      } else {
+        output = await this.executeAgentTool(item.tool, toolInput, input, config, executionModel);
+      }
+      const replayedItem: AiAgentHistoryItem = {
         step: history.length + 1,
         tool: item.tool,
         input: safeValue(toolInput),
         output: safeValue(output)
-      });
+      };
+      history.push(replayedItem);
+      await input.callbacks?.onToolFinish?.(replayedItem);
     }
     if (!hasVerificationAfterLastMutation(history)) {
       throw runtimeError('AI_AGENT_FAILED', 'cached trajectory did not verify the final state');
     }
     return history;
+  }
+
+  private async replayCachedAgentAction(
+    cached: AiAgentHistoryItem,
+    toolInput: Record<string, unknown>,
+    input: AiAgentInput,
+    config: VoleConfig,
+    executionModel?: string
+  ): Promise<unknown> {
+    const cachedOutput = cached.output && typeof cached.output === 'object'
+      ? cached.output as Record<string, unknown>
+      : undefined;
+    const actions = Array.isArray(cachedOutput?.actions)
+      ? cachedOutput.actions.filter(isReplayableAction)
+      : [];
+    if (actions.length > 0) {
+      try {
+        const results: AiActResult[] = [];
+        for (const action of actions) {
+          results.push(await this.replayAction(action, {
+            variables: input.variables,
+            model: executionModel
+          }));
+        }
+        return {
+          success: results.every((result) => result.success),
+          actions: results.flatMap((result) => result.actions),
+          fromCache: true,
+          selfHealed: false
+        };
+      } catch {
+        // The DOM changed. Fall through to semantic act so the trajectory can heal.
+      }
+    }
+    const healed = await this.executeAgentTool('act', toolInput, input, config, executionModel);
+    return healed && typeof healed === 'object'
+      ? { ...(healed as Record<string, unknown>), fromCache: true, selfHealed: true }
+      : healed;
+  }
+
+  private async handleAgentStep(
+    input: AiAgentInput,
+    event: StepResult<ToolSet, Record<string, unknown>>
+  ): Promise<void> {
+    await input.callbacks?.onStepFinish?.(event);
+    if (!input.callbacks?.onEvidence) {
+      return;
+    }
+    let observation: unknown;
+    try {
+      const snapshot = await this.snapshot();
+      const screenshot = await this.page.screenshot({ fullPage: false });
+      observation = {
+        url: snapshot.url,
+        tree: snapshot.text,
+        screenshotBase64: screenshot.toString('base64')
+      };
+    } catch (error) {
+      observation = {
+        url: this.page.url(),
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+    await input.callbacks.onEvidence({
+      type: 'step_finished',
+      step: event.stepNumber,
+      data: {
+        finishReason: event.finishReason,
+        text: event.text,
+        toolCalls: event.toolCalls.map((call) => ({
+          toolName: call.toolName,
+          input: safeValue(call.input)
+        })),
+        observation
+      }
+    });
   }
 
   private async *withChunkCallback(
@@ -1078,14 +1268,31 @@ export class AiRuntime {
         target: input.target,
         hasValue: input.value !== undefined,
         hasFilePath: input.filePath !== undefined,
-        variableNames: Object.keys(input.variables ?? {}),
+        variables: variablePromptEntries(input.variables).map(({ name, description }) => ({
+          placeholder: `%${name}%`,
+          description
+        })),
         snapshot: snapshot.text
       },
       schema: actionPlanSchema,
       timeoutMs,
+      abortSignal: input.abortSignal,
+      providerOptions: input.providerOptions,
       model: input.model
     });
     const plan = response.value;
+    if (!plan.elementId) {
+      return {
+        success: false,
+        message: 'Failed to perform act: No action found',
+        actionDescription: input.instruction,
+        actions: [],
+        fromCache: false,
+        selfHealed: false,
+        cacheStatus: 'MISS',
+        usage: response.usage
+      };
+    }
     const node = snapshot.nodes.find((item) => item.elementId === plan.elementId);
     const locator = node?.locators[0];
     if (!node || !locator) {
@@ -1105,7 +1312,7 @@ export class AiRuntime {
     await this.getExecutor().execute({
       method: action,
       locator,
-      value: input.value ?? plan.arguments?.[0],
+      value: substituteVariables(input.value ?? plan.arguments?.[0] ?? '', input.variables),
       filePath: input.filePath,
       targetLocator: dragTargetLocator,
       timeoutMs
@@ -1115,14 +1322,18 @@ export class AiRuntime {
       selector: this.getExecutor().selector(locator),
       description,
       method: action,
+      locator,
       arguments: action === 'dragAndDrop' && dragTargetNode && dragTargetLocator
         ? [
-            this.getExecutor().selector(dragTargetLocator)
+            dragTargetNode.xpath
+              ? `xpath=${dragTargetNode.xpath}`
+              : this.getExecutor().selector(dragTargetLocator)
           ]
         : plan.arguments
     }];
     let finalAction = action;
     let finalLocator = locator;
+    let usage = response.usage;
     if (plan.twoStep) {
       const secondSnapshot = await this.snapshot();
       const secondResponse = await this.completeObject<z.infer<typeof actionPlanSchema>>(config, {
@@ -1136,13 +1347,30 @@ export class AiRuntime {
           instruction: input.instruction,
           target: input.target,
           valueAvailable: input.value !== undefined,
-          snapshot: secondSnapshot.text
+          snapshot: snapshotDiff(snapshot, secondSnapshot)
         },
         schema: actionPlanSchema,
         timeoutMs,
+        abortSignal: input.abortSignal,
+        providerOptions: input.providerOptions,
         model: input.model
       });
+      usage = mergeUsage(usage, secondResponse.usage);
       const secondPlan = secondResponse.value;
+      if (!secondPlan.elementId) {
+        return {
+          success: true,
+          message: 'First action completed; no second action was found',
+          actionDescription: description,
+          actions,
+          action,
+          locator,
+          fromCache: false,
+          selfHealed: false,
+          cacheStatus: 'MISS',
+          usage
+        };
+      }
       const secondNode = secondSnapshot.nodes.find((item) => item.elementId === secondPlan.elementId);
       const secondLocator = secondNode?.locators[0];
       if (!secondNode || !secondLocator) {
@@ -1151,7 +1379,10 @@ export class AiRuntime {
       await this.getExecutor().execute({
         method: secondPlan.method,
         locator: secondLocator,
-        value: input.value ?? secondPlan.arguments?.[0],
+        value: substituteVariables(
+          input.value ?? secondPlan.arguments?.[0] ?? '',
+          input.variables
+        ),
         timeoutMs
       });
       finalAction = secondPlan.method;
@@ -1160,6 +1391,7 @@ export class AiRuntime {
         selector: this.getExecutor().selector(secondLocator),
         description: secondPlan.reasoning || `Complete ${input.instruction}`,
         method: secondPlan.method,
+        locator: secondLocator,
         arguments: secondPlan.arguments
       });
     }
@@ -1173,21 +1405,23 @@ export class AiRuntime {
       fromCache: false,
       selfHealed: false,
       cacheStatus: 'MISS',
-      usage: response.usage
+      usage
     };
   }
 
   private async replayAction(action: AiAction, options: AiActOptions): Promise<AiActResult> {
     const config = await this.config();
     const method = action.method ?? 'click';
-    const locator = this.getExecutor().descriptorFromSelector(action.selector);
+    const locator = action.locator ?? this.getExecutor().descriptorFromSelector(action.selector);
     const timeoutMs = options.timeoutMs ?? config.runtimeAi.timeoutMs;
     await this.getExecutor().execute({
       method,
       locator,
-      value: action.arguments?.[0],
+      value: substituteVariables(action.arguments?.[0] ?? '', options.variables),
       targetLocator: method === 'dragAndDrop' && action.arguments?.[0]
-        ? this.getExecutor().descriptorFromSelector(action.arguments[0])
+        ? this.getExecutor().descriptorFromSelector(
+            substituteVariables(action.arguments[0], options.variables)
+          )
         : undefined,
       timeoutMs
     });
@@ -1204,28 +1438,78 @@ export class AiRuntime {
     };
   }
 
+  private async replayActionWithHealing(
+    action: AiAction,
+    options: AiActOptions
+  ): Promise<AiActResult> {
+    try {
+      return await this.replayAction(action, options);
+    } catch (firstError) {
+      const config = await this.config();
+      if (!config.runtimeAi.selfHeal) {
+        throw this.wrapActError(firstError);
+      }
+      try {
+        const snapshot = await this.snapshot();
+        const result = await this.planAndExecute({
+          instruction: action.description,
+          action: action.method,
+          value: action.arguments?.[0],
+          variables: options.variables,
+          timeoutMs: options.timeoutMs,
+          model: options.model,
+          cache: options.cache,
+          abortSignal: options.abortSignal,
+          providerOptions: options.providerOptions
+        }, snapshot, options.timeoutMs ?? config.runtimeAi.timeoutMs);
+        return { ...result, selfHealed: true };
+      } catch (secondError) {
+        throw this.wrapActError(secondError, firstError);
+      }
+    }
+  }
+
   private async executeAgentTool(
     name: string,
     input: Record<string, unknown>,
     agentInput: AiAgentInput,
-    config: VoleConfig
+    config: VoleConfig,
+    executionModel?: string
   ): Promise<unknown> {
     switch (name) {
       case 'observe':
         return this.observe(requiredString(input, 'instruction'), {
-          variables: agentInput.variables
+          variables: agentInput.variables,
+          abortSignal: agentInput.abortSignal,
+          providerOptions: agentInput.providerOptions,
+          model: executionModel
         });
       case 'ariaTree':
-        return this.extract();
+      {
+        const result = await this.extract({
+          abortSignal: agentInput.abortSignal,
+          providerOptions: agentInput.providerOptions,
+          model: executionModel
+        });
+        return {
+          success: true,
+          content: result.pageText,
+          pageUrl: this.page.url()
+        };
+      }
       case 'act':
       {
+        const legacyInstruction = optionalString(input.instruction);
         const value = optionalString(input.value);
         return this.act({
-          instruction: requiredString(input, 'instruction'),
-          action: optionalAction(input.action),
+          instruction: legacyInstruction ?? requiredString(input, 'action'),
+          action: legacyInstruction ? optionalAction(input.action) : undefined,
           target: optionalString(input.target),
-          value: value === undefined ? undefined : interpolateVariables(value, agentInput.variables),
-          variables: agentInput.variables
+          value: value ? substituteVariables(value, agentInput.variables) : undefined,
+          variables: agentInput.variables,
+          abortSignal: agentInput.abortSignal,
+          providerOptions: agentInput.providerOptions,
+          model: executionModel
         });
       }
       case 'assert':
@@ -1235,29 +1519,49 @@ export class AiRuntime {
             .parse(input.kind),
           target: optionalString(input.target),
           expected: optionalString(input.expected),
-          variables: agentInput.variables
+          variables: agentInput.variables,
+          abortSignal: agentInput.abortSignal,
+          providerOptions: agentInput.providerOptions
         });
       case 'extract':
-        return this.extract(
-          requiredString(input, 'instruction'),
-          z.object({ summary: z.string(), evidence: z.array(z.string()).default([]) })
-        );
+      {
+        const schema = input.schema && typeof input.schema === 'object'
+          ? jsonSchemaToZod(input.schema as JsonSchema)
+          : z.object({ extraction: z.string() });
+        return this.extract(requiredString(input, 'instruction'), schema, {
+          model: executionModel,
+          abortSignal: agentInput.abortSignal,
+          providerOptions: agentInput.providerOptions
+        });
+      }
       case 'fillForm': {
-        const fields = z.array(z.object({
-          target: z.string().min(1),
-          value: z.string()
-        })).parse(input.fields);
-        const results = [];
-        for (const field of fields) {
-          results.push(await this.act({
-            instruction: `Fill ${field.target}`,
-            action: 'fill',
-            target: field.target,
-            value: interpolateVariables(field.value, agentInput.variables),
-            variables: agentInput.variables
+        const fields = z.array(z.union([
+          z.object({ action: z.string().min(1) }),
+          z.object({ target: z.string().min(1), value: z.string() })
+        ])).parse(input.fields).map((field) => (
+          'action' in field
+            ? field
+            : { action: `type ${field.value} into the ${field.target} input` }
+        ));
+        const instruction = `Return observation results for these form actions: ${
+          fields.map((field) => field.action).join(', ')
+        }`;
+        const observed = await this.observe(instruction, {
+          variables: agentInput.variables,
+          abortSignal: agentInput.abortSignal,
+          providerOptions: agentInput.providerOptions,
+          model: executionModel
+        });
+        const results: AiActResult[] = [];
+        for (const action of observed) {
+          results.push(await this.act(action, {
+            variables: agentInput.variables,
+            abortSignal: agentInput.abortSignal,
+            providerOptions: agentInput.providerOptions,
+            model: executionModel
           }));
         }
-        return results;
+        return { success: results.every((result) => result.success), actions: results };
       }
       case 'goto': {
         const target = new URL(requiredString(input, 'url'), this.page.url() || config.baseUrl);
@@ -1273,36 +1577,75 @@ export class AiRuntime {
       }
       case 'scroll': {
         const direction = z.enum(['up', 'down']).parse(input.direction);
-        const amount = typeof input.amount === 'number' ? input.amount : 600;
+        const percentage = typeof input.percentage === 'number' ? input.percentage : 80;
+        const viewportHeight = await this.page.evaluate(() => window.innerHeight);
+        const amount = Math.round(viewportHeight * percentage / 100);
         await this.page.mouse.wheel(0, direction === 'down' ? amount : -amount);
-        return { direction, amount };
+        return { success: true, direction, percentage, scrolledPixels: amount };
       }
-      case 'keys':
+      case 'keys': {
+        const method = input.method === undefined
+          ? 'press'
+          : z.enum(['press', 'type']).parse(input.method);
+        const originalValue = optionalString(input.value) ?? requiredString(input, 'key');
+        const value = substituteVariables(originalValue, agentInput.variables);
+        const repeat = Math.max(1, typeof input.repeat === 'number' ? input.repeat : 1);
+        for (let index = 0; index < repeat; index += 1) {
+          if (method === 'type') {
+            await this.page.keyboard.type(value, { delay: 100 });
+          } else {
+            await this.page.keyboard.press(value);
+          }
+        }
+        return { success: true, method, value: originalValue, repeat };
+      }
       case 'pressKey': {
         const key = requiredString(input, 'key');
         await this.page.keyboard.press(key);
         return { key };
       }
+      case 'navback':
       case 'navBack':
       case 'goBack':
         await this.page.goBack({ waitUntil: 'domcontentloaded' });
         return { url: this.page.url() };
       case 'wait': {
-        const ms = Math.min(typeof input.ms === 'number' ? input.ms : 1000, 10000);
+        const ms = Math.min(
+          typeof input.timeMs === 'number'
+            ? input.timeMs
+            : typeof input.ms === 'number'
+              ? input.ms
+              : 1000,
+          10000
+        );
         await this.page.waitForTimeout(ms);
-        return { ms };
+        return { success: true, waited: ms };
       }
       case 'screenshot': {
         const outputPath = await this.artifactPath('agent-screenshot', 'png');
-        await this.page.screenshot({ path: outputPath, fullPage: false });
-        return { path: outputPath };
+        const buffer = await this.page.screenshot({ path: outputPath, fullPage: false });
+        return {
+          success: true,
+          base64: buffer.toString('base64'),
+          path: outputPath,
+          timestamp: Date.now(),
+          pageUrl: this.page.url()
+        };
       }
       case 'think':
-        return { noted: requiredString(input, 'thought') };
+        return {
+          acknowledged: true,
+          message: optionalString(input.reasoning) ?? requiredString(input, 'thought')
+        };
       case 'done':
         return {
-          success: Boolean(input.success),
-          message: requiredString(input, 'message')
+          success: Boolean(input.success ?? input.taskComplete),
+          message: optionalString(input.message) ??
+            optionalString(input.reasoning) ??
+            'Task execution completed',
+          output: input.output && typeof input.output === 'object'
+            ? input.output as Record<string, unknown>
+            : undefined
         };
       default:
         throw runtimeError('AI_AGENT_FAILED', `unsupported agent tool: ${name}`);
@@ -1381,7 +1724,11 @@ export class AiRuntime {
 
   private async artifact(kind: string, value: unknown): Promise<string> {
     const filePath = await this.artifactPath(kind, 'json');
-    await writeFile(filePath, `${JSON.stringify(safeValue(value), null, 2)}\n`, 'utf8');
+    await writeFile(
+      filePath,
+      `${JSON.stringify(safeValue(redactEmbeddedVariables(value)), null, 2)}\n`,
+      'utf8'
+    );
     return filePath;
   }
 
@@ -1411,96 +1758,6 @@ export function createAiRuntime(page: Page, options: CreateAiRuntimeOptions = {}
   return new AiRuntime(page, options);
 }
 
-const agentTools: ModelTool[] = [
-  tool('observe', 'Find relevant elements in the current page', {
-    instruction: stringProperty()
-  }, ['instruction']),
-  tool('act', 'Perform one browser action on one element', {
-    instruction: stringProperty(),
-    action: { type: 'string', enum: actionMethodSchema.options },
-    target: stringProperty(),
-    value: stringProperty()
-  }, ['instruction']),
-  tool('assert', 'Verify the current browser state', {
-    instruction: stringProperty(),
-    kind: {
-      type: 'string',
-      enum: ['visible', 'hidden', 'text', 'containsText', 'enabled', 'disabled', 'semantic']
-    },
-    target: stringProperty(),
-    expected: stringProperty()
-  }, ['instruction', 'kind']),
-  tool('extract', 'Extract a concise fact summary from the page', {
-    instruction: stringProperty()
-  }, ['instruction']),
-  tool('fillForm', 'Fill several form fields', {
-    fields: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          target: stringProperty(),
-          value: stringProperty()
-        },
-        required: ['target', 'value'],
-        additionalProperties: false
-      }
-    }
-  }, ['fields']),
-  tool('goto', 'Navigate to a same-origin URL', { url: stringProperty() }, ['url']),
-  tool('scroll', 'Scroll the current page', {
-    direction: { type: 'string', enum: ['up', 'down'] },
-    amount: { type: 'number' }
-  }, ['direction']),
-  tool('pressKey', 'Press a keyboard key or chord', { key: stringProperty() }, ['key']),
-  tool('goBack', 'Navigate back one page', {}, []),
-  tool('wait', 'Wait briefly for asynchronous UI updates', { ms: { type: 'number' } }, ['ms']),
-  tool('screenshot', 'Save a screenshot for later diagnostics', {}, []),
-  tool('think', 'Record concise planning without changing the page', { thought: stringProperty() }, ['thought']),
-  tool('done', 'Finish the agent run', {
-    success: { type: 'boolean' },
-    message: stringProperty()
-  }, ['success', 'message'])
-];
-
-function tool(
-  name: string,
-  description: string,
-  properties: Record<string, unknown>,
-  required: string[]
-): ModelTool {
-  return {
-    type: 'function',
-    function: {
-      name,
-      description,
-      parameters: {
-        type: 'object',
-        properties,
-        required,
-        additionalProperties: false
-      }
-    }
-  };
-}
-
-function stringProperty(): Record<string, unknown> {
-  return { type: 'string' };
-}
-
-function parseToolArguments(call: ModelToolCall): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(call.function.arguments);
-    return z.record(z.unknown()).parse(parsed);
-  } catch (error) {
-    throw runtimeError(
-      'AI_MODEL_INVALID_RESPONSE',
-      `invalid arguments for tool ${call.function.name}`,
-      error instanceof Error ? error.message : String(error)
-    );
-  }
-}
-
 function requiredString(input: Record<string, unknown>, key: string): string {
   return z.string().min(1).parse(input[key]);
 }
@@ -1511,10 +1768,6 @@ function optionalString(value: unknown): string | undefined {
 
 function optionalAction(value: unknown): AiActionMethod | undefined {
   return value === undefined ? undefined : actionMethodSchema.parse(value);
-}
-
-function interpolateVariables(value: string, variables?: Record<string, string>): string {
-  return value.replace(/\$\{([^}]+)\}/gu, (_, key: string) => variables?.[key] ?? '');
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -1583,26 +1836,93 @@ function isAiAction(value: unknown): value is AiAction {
   );
 }
 
-function replaceElementUrls(value: unknown, urlMap: Record<string, string>, baseUrl: string): unknown {
-  if (typeof value === 'string' && urlMap[value]) {
+type UrlPathSegment = string | '*';
+
+function transformUrlSchema(
+  schema: z.ZodTypeAny,
+  path: UrlPathSegment[] = []
+): { schema: z.ZodTypeAny; urlPaths: UrlPathSegment[][] } {
+  if (schema instanceof z.ZodString) {
+    const checks = (schema._def as { checks?: Array<{ kind?: string }> }).checks ?? [];
+    if (checks.some((check) => check.kind === 'url')) {
+      return {
+        schema: schema.description ? z.string().describe(schema.description) : z.string(),
+        urlPaths: [path]
+      };
+    }
+    return { schema, urlPaths: [] };
+  }
+  if (schema instanceof z.ZodObject) {
+    const shape = schema.shape;
+    const urlPaths: UrlPathSegment[][] = [];
+    const transformedShape = Object.fromEntries(
+      Object.entries(shape).map(([key, child]) => {
+        const transformed = transformUrlSchema(child as z.ZodTypeAny, [...path, key]);
+        urlPaths.push(...transformed.urlPaths);
+        return [key, transformed.schema];
+      })
+    );
+    return { schema: z.object(transformedShape), urlPaths };
+  }
+  if (schema instanceof z.ZodArray) {
+    const transformed = transformUrlSchema(schema.element, [...path, '*']);
+    return { schema: z.array(transformed.schema), urlPaths: transformed.urlPaths };
+  }
+  if (schema instanceof z.ZodOptional) {
+    const transformed = transformUrlSchema(schema.unwrap(), path);
+    return { schema: transformed.schema.optional(), urlPaths: transformed.urlPaths };
+  }
+  if (schema instanceof z.ZodNullable) {
+    const transformed = transformUrlSchema(schema.unwrap(), path);
+    return { schema: transformed.schema.nullable(), urlPaths: transformed.urlPaths };
+  }
+  return { schema, urlPaths: [] };
+}
+
+function restoreUrlFields(
+  value: unknown,
+  paths: UrlPathSegment[][],
+  urlMap: Record<string, string>,
+  baseUrl: string
+): unknown {
+  let result = value;
+  for (const path of paths) {
+    result = restoreUrlPath(result, path, urlMap, baseUrl);
+  }
+  return result;
+}
+
+function restoreUrlPath(
+  current: unknown,
+  path: UrlPathSegment[],
+  urlMap: Record<string, string>,
+  baseUrl: string
+): unknown {
+  if (path.length === 0) {
+    if (typeof current !== 'string' || !urlMap[current]) {
+      return current;
+    }
     try {
-      return new URL(urlMap[value], baseUrl).toString();
+      return new URL(urlMap[current], baseUrl).toString();
     } catch {
-      return urlMap[value];
+      return urlMap[current];
     }
   }
-  if (Array.isArray(value)) {
-    return value.map((item) => replaceElementUrls(item, urlMap, baseUrl));
+  if (!current || typeof current !== 'object') {
+    return current;
   }
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
-        key,
-        replaceElementUrls(item, urlMap, baseUrl)
-      ])
-    );
+  const [segment, ...rest] = path;
+  if (segment === '*') {
+    if (Array.isArray(current)) {
+      for (let index = 0; index < current.length; index += 1) {
+        current[index] = restoreUrlPath(current[index], rest, urlMap, baseUrl);
+      }
+    }
+    return current;
   }
-  return value;
+  const record = current as Record<string, unknown>;
+  record[segment] = restoreUrlPath(record[segment], rest, urlMap, baseUrl);
+  return current;
 }
 
 function attachResultMetadata(
@@ -1634,8 +1954,8 @@ function normalizeAgentInput(input: string | AiAgentExecuteOptions): AiAgentInpu
 function agentSystemPrompt(): string {
   return [
     'You are a bounded DOM browser automation agent operating an existing Playwright page.',
-    'Ground actions with observe or ariaTree, use only supplied tools, and keep actions atomic.',
-    'Never report success until observe, extract, or assert has verified the final state.',
+    'Use ariaTree for page grounding, use only supplied tools, and keep actions atomic.',
+    'Never report success until ariaTree or extract has verified the final state.',
     'Call done exactly once when the goal is complete or impossible.'
   ].join(' ');
 }
@@ -1643,12 +1963,32 @@ function agentSystemPrompt(): string {
 function agentPrompt(input: AiAgentInput, currentUrl: string): string {
   return JSON.stringify({
     goal: input.instruction,
-    variableNames: Object.keys(input.variables ?? {}),
+    variables: variablePromptEntries(input.variables).map(({ name, description }) => ({
+      placeholder: `%${name}%`,
+      description
+    })),
     currentUrl
   });
 }
 
-function lastDone(history: AiAgentHistoryItem[]): { success: boolean; message: string } | undefined {
+function agentCallPrompt(
+  input: AiAgentInput,
+  currentUrl: string
+): { messages: NonNullable<AiAgentInput['messages']> } | { prompt: string } {
+  if (input.messages?.length) {
+    return {
+      messages: [
+        ...input.messages,
+        { role: 'user', content: input.instruction }
+      ]
+    };
+  }
+  return { prompt: agentPrompt(input, currentUrl) };
+}
+
+function lastDone(
+  history: AiAgentHistoryItem[]
+): { success: boolean; message: string; output?: Record<string, unknown> } | undefined {
   const item = [...history].reverse().find((entry) => entry.tool === 'done');
   if (!item?.output || typeof item.output !== 'object') {
     return undefined;
@@ -1656,8 +1996,85 @@ function lastDone(history: AiAgentHistoryItem[]): { success: boolean; message: s
   const output = item.output as Record<string, unknown>;
   return {
     success: output.success === true,
-    message: typeof output.message === 'string' ? output.message : 'Agent did not provide a final message'
+    message: typeof output.message === 'string' ? output.message : 'Agent did not provide a final message',
+    output: output.output && typeof output.output === 'object'
+      ? output.output as Record<string, unknown>
+      : undefined
   };
+}
+
+type JsonSchema = {
+  type?: string | string[];
+  enum?: Array<string | number | boolean | null>;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  items?: JsonSchema;
+  format?: string;
+  description?: string;
+};
+
+function jsonSchemaToZod(schema: JsonSchema): z.ZodTypeAny {
+  if (schema.enum?.length) {
+    const literals = schema.enum.map((value) => z.literal(value));
+    return literals.length === 1
+      ? literals[0]!
+      : z.union(literals as [z.ZodLiteral<unknown>, z.ZodLiteral<unknown>, ...z.ZodLiteral<unknown>[]]);
+  }
+  const rawType = Array.isArray(schema.type)
+    ? schema.type.find((type) => type !== 'null')
+    : schema.type;
+  let result: z.ZodTypeAny;
+  switch (rawType) {
+    case 'object': {
+      const required = new Set(schema.required ?? []);
+      const shape = Object.fromEntries(
+        Object.entries(schema.properties ?? {}).map(([key, child]) => {
+          const childSchema = jsonSchemaToZod(child);
+          return [key, required.has(key) ? childSchema : childSchema.optional()];
+        })
+      );
+      result = z.object(shape).passthrough();
+      break;
+    }
+    case 'array':
+      result = z.array(jsonSchemaToZod(schema.items ?? {}));
+      break;
+    case 'integer':
+      result = z.number().int();
+      break;
+    case 'number':
+      result = z.number();
+      break;
+    case 'boolean':
+      result = z.boolean();
+      break;
+    case 'null':
+      result = z.null();
+      break;
+    case 'string':
+      result = schema.format === 'uri' || schema.format === 'url'
+        ? z.string().url()
+        : z.string();
+      break;
+    default:
+      result = z.unknown();
+  }
+  if (schema.description) {
+    result = result.describe(schema.description);
+  }
+  return Array.isArray(schema.type) && schema.type.includes('null')
+    ? result.nullable()
+    : result;
+}
+
+function isReplayableAction(value: unknown): value is AiAction {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const action = value as Record<string, unknown>;
+  return typeof action.selector === 'string' &&
+    typeof action.description === 'string' &&
+    (action.method === undefined || actionMethodSchema.safeParse(action.method).success);
 }
 
 function toRuntimeUsage(usage: {
@@ -1691,9 +2108,38 @@ function shouldTerminateAgentTool(error: unknown): boolean {
     /target page.*closed|browser.*closed|context.*closed/iu.test(error.message);
 }
 
+function normalizeAgentError(
+  error: Error,
+  history: AiAgentHistoryItem[]
+): Error {
+  if (error instanceof AiRuntimeError) {
+    if (
+      error.code === 'AI_AGENT_FAILED' &&
+      history.length === 0 &&
+      /without a successful done|stopped without|did not complete/iu.test(error.message)
+    ) {
+      return runtimeError(
+        'AI_MODEL_CAPABILITY_UNSUPPORTED',
+        'agent model did not call any DOM tool; verify that tool calling is supported'
+      );
+    }
+    return error;
+  }
+  if (
+    /tool(?:s|_choice| calling)?.*(?:not supported|unsupported|unavailable)|function calling.*(?:not supported|unsupported)/iu
+      .test(error.message)
+  ) {
+    return runtimeError(
+      'AI_MODEL_CAPABILITY_UNSUPPORTED',
+      `agent model does not support required tool calling: ${error.message}`
+    );
+  }
+  return runtimeError('AI_AGENT_FAILED', error.message, { history });
+}
+
 function transformHistoryVariables(
   history: AiAgentHistoryItem[],
-  variables: Record<string, string> | undefined,
+  variables: AiVariables | undefined,
   mode: 'template' | 'hydrate'
 ): AiAgentHistoryItem[] {
   return history.map((item) => ({
@@ -1705,7 +2151,7 @@ function transformHistoryVariables(
 
 function transformActionVariables(
   actions: AiAction[],
-  variables: Record<string, string> | undefined,
+  variables: AiVariables | undefined,
   mode: 'template' | 'hydrate'
 ): AiAction[] {
   return actions.map((action) => ({
@@ -1718,7 +2164,11 @@ function transformActionVariables(
 }
 
 function safeValue(value: unknown, key = ''): unknown {
-  if (/(password|token|secret|api.?key)/iu.test(key)) {
+  if (
+    /(password|secret|api.?key|api.?token|access.?token|refresh.?token|authorization|base64)/iu
+      .test(key) ||
+    /^token$/iu.test(key)
+  ) {
     return '[REDACTED]';
   }
   if (Array.isArray(value)) {
@@ -1737,64 +2187,54 @@ function safeValue(value: unknown, key = ''): unknown {
   return value;
 }
 
+function redactEmbeddedVariables(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactEmbeddedVariables(item));
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  const record = value as Record<string, unknown>;
+  const variables = record.variables && typeof record.variables === 'object'
+    ? record.variables as AiVariables
+    : undefined;
+  const transformed = variables
+    ? transformVariables(record, variables, 'template') as Record<string, unknown>
+    : record;
+  return Object.fromEntries(
+    Object.entries(transformed).map(([key, child]) => [
+      key,
+      redactEmbeddedVariables(child)
+    ])
+  );
+}
+
 function hasVerificationAfterLastMutation(history: AiAgentHistoryItem[]): boolean {
   const verificationTools = new Set(['observe', 'ariaTree', 'assert', 'extract']);
-  const mutationTools = new Set([
-    'act',
-    'fillForm',
-    'goto',
-    'scroll',
-    'keys',
-    'navBack',
-    'pressKey',
-    'goBack',
-    'wait'
-  ]);
+  const nonMutationTools = new Set(['done', 'think', 'screenshot']);
   let lastVerification = -1;
   let lastMutation = -1;
   for (const [index, item] of history.entries()) {
     if (verificationTools.has(item.tool)) {
       lastVerification = index;
     }
-    if (mutationTools.has(item.tool)) {
+    if (!verificationTools.has(item.tool) && !nonMutationTools.has(item.tool)) {
       lastMutation = index;
     }
   }
   return lastVerification > lastMutation;
 }
 
-function transformToolCallVariables(
-  calls: ModelToolCall[],
-  variables: Record<string, string> | undefined,
-  mode: 'template' | 'hydrate'
-): ModelToolCall[] {
-  return calls.map((call) => {
-    try {
-      const parsed = JSON.parse(call.function.arguments);
-      const transformed = transformVariables(parsed, variables, mode);
-      return {
-        ...call,
-        function: {
-          ...call.function,
-          arguments: JSON.stringify(transformed)
-        }
-      };
-    } catch {
-      return call;
-    }
-  });
-}
-
 function transformVariables(
   value: unknown,
-  variables: Record<string, string> | undefined,
+  variables: AiVariables | undefined,
   mode: 'template' | 'hydrate'
 ): unknown {
   if (typeof value === 'string') {
     if (mode === 'template') {
       return redactVariableValues(value, variables);
     }
-    return value.replace(/\$\{([^}]+)\}/gu, (_, key: string) => variables?.[key] ?? '');
+    return substituteVariables(value, variables);
   }
   if (Array.isArray(value)) {
     return value.map((item) => transformVariables(item, variables, mode));
@@ -1808,4 +2248,45 @@ function transformVariables(
     );
   }
   return value;
+}
+
+function snapshotDiff(before: PageSnapshot, after: PageSnapshot): string {
+  const previous = new Map(
+    before.nodes.map((node) => [
+      node.elementId,
+      JSON.stringify([node.tag, node.role, node.name, node.value, node.disabled])
+    ])
+  );
+  const changedIds = new Set(
+    after.nodes
+      .filter((node) => previous.get(node.elementId) !==
+        JSON.stringify([node.tag, node.role, node.name, node.value, node.disabled]))
+      .map((node) => node.elementId)
+  );
+  const changedLines = after.text
+    .split('\n')
+    .filter((line) => {
+      const match = line.match(/^\[([^\]]+)\]/u);
+      return !match || (match[1] ? changedIds.has(match[1]) : false);
+    });
+  return changedIds.size > 0 ? changedLines.join('\n') : after.text;
+}
+
+function mergeUsage(
+  left: ModelObjectResult<unknown>['usage'],
+  right?: ModelObjectResult<unknown>['usage']
+): ModelObjectResult<unknown>['usage'] {
+  if (!right) {
+    return left;
+  }
+  const add = (a?: number, b?: number): number | undefined =>
+    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
+  return {
+    inputTokens: add(left.inputTokens, right.inputTokens),
+    outputTokens: add(left.outputTokens, right.outputTokens),
+    totalTokens: add(left.totalTokens, right.totalTokens),
+    reasoningTokens: add(left.reasoningTokens, right.reasoningTokens),
+    cachedInputTokens: add(left.cachedInputTokens, right.cachedInputTokens),
+    cacheWriteTokens: add(left.cacheWriteTokens, right.cacheWriteTokens)
+  };
 }

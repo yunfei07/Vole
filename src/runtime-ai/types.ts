@@ -1,5 +1,29 @@
-import type { ModelMessage, PrepareStepFunction, ToolSet } from 'ai';
+import type {
+  ModelMessage,
+  PrepareStepFunction,
+  StepResult,
+  StreamTextResult,
+  ToolSet
+} from 'ai';
 import type { z } from 'zod';
+
+type RuntimeJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | RuntimeJsonValue[]
+  | { [key: string]: RuntimeJsonValue };
+
+export type RuntimeProviderOptions = Record<string, Record<string, RuntimeJsonValue>>;
+
+export type AiVariableValue =
+  | string
+  | number
+  | boolean
+  | { value: string | number | boolean; description?: string };
+
+export type AiVariables = Record<string, AiVariableValue>;
 
 export type AiActionMethod =
   | 'click'
@@ -21,6 +45,7 @@ export type LocatorDescriptor = {
   value: string;
   name?: string;
   frameUrl?: string;
+  frameOrdinal?: number;
 };
 
 export type SnapshotNode = {
@@ -57,6 +82,7 @@ export type AiAction = {
   description: string;
   method?: AiActionMethod;
   arguments?: string[];
+  locator?: LocatorDescriptor;
 };
 
 export type AiActInput = {
@@ -65,16 +91,21 @@ export type AiActInput = {
   target?: string;
   value?: string;
   filePath?: string;
-  variables?: Record<string, string>;
+  variables?: AiVariables;
   timeoutMs?: number;
   model?: string;
+  cache?: boolean;
+  abortSignal?: AbortSignal;
+  providerOptions?: RuntimeProviderOptions;
 };
 
 export type AiActOptions = {
   model?: string;
-  variables?: Record<string, string>;
+  variables?: AiVariables;
   timeoutMs?: number;
   cache?: boolean;
+  abortSignal?: AbortSignal;
+  providerOptions?: RuntimeProviderOptions;
 };
 
 export type AiActResult = {
@@ -94,9 +125,11 @@ export type AiObserveOptions = {
   timeoutMs?: number;
   selector?: string;
   ignoreSelectors?: string[];
-  variables?: Record<string, string>;
+  variables?: AiVariables;
   model?: string;
   cache?: boolean;
+  abortSignal?: AbortSignal;
+  providerOptions?: RuntimeProviderOptions;
 };
 
 export type AiActionCandidate = AiAction & {
@@ -114,6 +147,8 @@ export type AiExtractOptions = {
   context?: string;
   screenshot?: boolean;
   model?: string;
+  abortSignal?: AbortSignal;
+  providerOptions?: RuntimeProviderOptions;
 };
 
 export type AiAssertKind =
@@ -130,8 +165,11 @@ export type AiAssertInput = {
   kind: AiAssertKind;
   target?: string;
   expected?: string;
-  variables?: Record<string, string>;
+  variables?: AiVariables;
   timeoutMs?: number;
+  model?: string;
+  abortSignal?: AbortSignal;
+  providerOptions?: RuntimeProviderOptions;
 };
 
 export type AiAssertResult = {
@@ -143,13 +181,14 @@ export type AiAssertResult = {
 
 export type AiAgentInput = {
   instruction: string;
-  variables?: Record<string, string>;
+  variables?: AiVariables;
   maxSteps?: number;
   timeoutMs?: number;
   abortSignal?: AbortSignal;
   messages?: ModelMessage[];
   output?: z.ZodType<Record<string, unknown>>;
   callbacks?: AiAgentCallbacks;
+  providerOptions?: RuntimeProviderOptions;
 };
 
 export type AiAgentHistoryItem = {
@@ -169,13 +208,16 @@ export type AiAgentResult = {
   usage?: RuntimeModelUsage & { inferenceTimeMs?: number };
   messages?: ModelMessage[];
   output?: Record<string, unknown>;
+  cacheStatus?: 'HIT' | 'MISS';
+  selfHealed?: boolean;
 };
 
 export type AiAgentCallbacks = {
   prepareStep?: PrepareStepFunction<ToolSet>;
-  onStepFinish?: (item: AiAgentHistoryItem) => void | Promise<void>;
+  onStepFinish?: (event: StepResult<ToolSet, Record<string, unknown>>) => void | Promise<void>;
+  onToolFinish?: (item: AiAgentHistoryItem) => void | Promise<void>;
   onEvidence?: (event: {
-    type: 'screenshot' | 'action' | 'observation' | 'final';
+    type: 'screenshot' | 'action' | 'observation' | 'step_finished' | 'final';
     step?: number;
     data: unknown;
   }) => void | Promise<void>;
@@ -192,6 +234,7 @@ export type AiAgentConfig = {
   stream?: boolean;
   systemPrompt?: string;
   tools?: ToolSet;
+  excludeTools?: string[];
 };
 
 export type AiAgentExecuteOptions = AiAgentInput;
@@ -201,8 +244,8 @@ export type AiAgentInstance = {
 };
 
 export type AiStreamingAgentInstance = {
-  execute(input: string | AiAgentExecuteOptions): Promise<{
-    textStream: AsyncIterable<string>;
+  execute(input: string | AiAgentExecuteOptions): Promise<
+    StreamTextResult<ToolSet, Record<string, unknown>, never> & {
     result: Promise<AiAgentResult>;
   }>;
 };

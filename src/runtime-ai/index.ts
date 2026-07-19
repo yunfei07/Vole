@@ -3,10 +3,16 @@ export { AiRuntimeError, type AiRuntimeErrorCode } from './errors.js';
 export { buildSnapshot, PageSnapshotter } from './snapshot.js';
 export { ActionExecutor } from './action-executor.js';
 export {
+  flattenVariables,
+  redactVariables,
+  resolveVariableValue,
+  substituteVariables,
+  variablePromptEntries
+} from './variables.js';
+export {
   AiRuntimeCache,
   redactVariableValues,
   type CachedAction,
-  type CachedAgentDecision,
   type CachedAgentTrajectory
 } from './cache.js';
 export {
@@ -36,7 +42,10 @@ export type {
   AiAssertResult,
   AiExtractOptions,
   AiObserveOptions,
+  AiVariableValue,
+  AiVariables,
   LocatorDescriptor,
   PageSnapshot,
+  RuntimeProviderOptions,
   SnapshotNode
 } from './types.js';

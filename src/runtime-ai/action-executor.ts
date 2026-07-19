@@ -6,7 +6,7 @@ export class ActionExecutor {
   constructor(private readonly page: Page) {}
 
   locator(descriptor: LocatorDescriptor): Locator {
-    const scope = this.scopeFor(descriptor.frameUrl);
+    const scope = this.scopeFor(descriptor.frameUrl, descriptor.frameOrdinal);
     switch (descriptor.strategy) {
       case 'testId':
         return scope.getByTestId(descriptor.value);
@@ -34,6 +34,33 @@ export class ActionExecutor {
     }
     if (selector.startsWith('/')) {
       return { strategy: 'xpath', value: selector, frameUrl };
+    }
+    const testId = selector.match(/^\[data-testid=(.+)\]$/u);
+    if (testId?.[1]) {
+      return {
+        strategy: 'testId',
+        value: parseSerializedValue(testId[1]),
+        frameUrl
+      };
+    }
+    const role = selector.match(/^role=([^\[]+)\[name=(.+)\]$/u);
+    if (role?.[1] && role[2]) {
+      return {
+        strategy: 'role',
+        value: role[1],
+        name: parseSerializedValue(role[2]),
+        frameUrl
+      };
+    }
+    for (const strategy of ['label', 'placeholder', 'text'] as const) {
+      const prefix = `${strategy}=`;
+      if (selector.startsWith(prefix)) {
+        return {
+          strategy,
+          value: parseSerializedValue(selector.slice(prefix.length)),
+          frameUrl
+        };
+      }
     }
     return { strategy: 'css', value: selector, frameUrl };
   }
@@ -87,7 +114,7 @@ export class ActionExecutor {
         return;
       case 'selectOption':
       case 'selectOptionFromDropdown':
-        await locator.selectOption({ label: input.value ?? '' }, { timeout });
+        await locator.selectOption(input.value ?? '', { timeout });
         return;
       case 'setInputFiles':
         if (!input.filePath) {
@@ -99,13 +126,30 @@ export class ActionExecutor {
         await locator.press(input.value || 'Enter', { timeout });
         return;
       case 'scrollTo':
-        await locator.scrollIntoViewIfNeeded({ timeout });
+        await locator.evaluate((element, rawValue) => {
+          const value = String(rawValue ?? '').trim();
+          if (!value) {
+            element.scrollIntoView({ block: 'center', inline: 'nearest' });
+            return;
+          }
+          const percentage = Number.parseFloat(value.replace(/%$/u, ''));
+          if (!Number.isFinite(percentage)) {
+            element.scrollIntoView({ block: 'center', inline: 'nearest' });
+            return;
+          }
+          const scrollable = element as HTMLElement;
+          scrollable.scrollTo({
+            top: Math.max(0, scrollable.scrollHeight - scrollable.clientHeight) *
+              Math.min(100, Math.max(0, percentage)) / 100,
+            behavior: 'smooth'
+          });
+        }, input.value);
         return;
       case 'nextChunk':
-        await this.page.mouse.wheel(0, 700);
+        await scrollElementChunk(locator, 1);
         return;
       case 'prevChunk':
-        await this.page.mouse.wheel(0, -700);
+        await scrollElementChunk(locator, -1);
         return;
       case 'dragAndDrop':
         if (!input.targetLocator) {
@@ -131,11 +175,40 @@ export class ActionExecutor {
     };
   }
 
-  private scopeFor(frameUrl?: string): Page | Frame {
+  private scopeFor(frameUrl?: string, frameOrdinal?: number): Page | Frame {
+    if (frameOrdinal !== undefined && frameOrdinal > 0) {
+      return this.page.frames()[frameOrdinal] ?? this.page;
+    }
     if (!frameUrl || sameDocumentUrl(frameUrl, this.page.url())) {
       return this.page;
     }
     return this.page.frames().find((frame) => sameDocumentUrl(frame.url(), frameUrl)) ?? this.page;
+  }
+}
+
+async function scrollElementChunk(locator: Locator, direction: 1 | -1): Promise<void> {
+  await locator.evaluate((element, dir) => {
+    const target = element as HTMLElement;
+    if (target === document.documentElement || target === document.body) {
+      window.scrollBy({
+        top: (window.visualViewport?.height ?? window.innerHeight) * dir,
+        behavior: 'smooth'
+      });
+      return;
+    }
+    target.scrollBy({
+      top: target.getBoundingClientRect().height * dir,
+      behavior: 'smooth'
+    });
+  }, direction);
+}
+
+function parseSerializedValue(value: string): string {
+  try {
+    const parsed = JSON.parse(value);
+    return typeof parsed === 'string' ? parsed : value;
+  } catch {
+    return value;
   }
 }
 

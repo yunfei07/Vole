@@ -17,7 +17,7 @@
     "dev": "tsx src/cli/index.ts",
     "demo": "tsx src/demo/server.ts",
     "test": "tsc -p tsconfig.json && node --test tests/unit/*.test.mjs",
-    "test:runtime-ai": "tsc -p tsconfig.json && node --test tests/unit/model-client.test.mjs tests/unit/runtime-ai.test.mjs",
+    "test:runtime-ai": "tsc -p tsconfig.json && node --test tests/unit/model-client.test.mjs tests/unit/runtime-ai.test.mjs tests/integration/runtime-ai-browser.test.mjs",
     "test:live-ai": "tsc -p tsconfig.json && node --test tests/live/runtime-ai-live.test.mjs"
   },
   "dependencies": {

@@ -2,8 +2,14 @@ import { createHash } from 'node:crypto';
 import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ensureDir, pathExists } from '../utils/fs.js';
-import type { ModelToolCall } from './model-client.js';
-import type { AiAction, AiActionMethod, AiAgentHistoryItem, LocatorDescriptor } from './types.js';
+import type {
+  AiAction,
+  AiActionMethod,
+  AiAgentHistoryItem,
+  AiVariables,
+  LocatorDescriptor
+} from './types.js';
+import { redactVariables } from './variables.js';
 
 const CACHE_VERSION = 2;
 
@@ -36,14 +42,6 @@ export type CachedAgentTrajectory = {
   updatedAt: string;
 };
 
-export type CachedAgentDecision = {
-  version: number;
-  key: string;
-  toolCalls: ModelToolCall[];
-  createdAt: string;
-  updatedAt: string;
-};
-
 export class AiRuntimeCache {
   constructor(private readonly rootDir: string) {}
 
@@ -52,9 +50,9 @@ export class AiRuntimeCache {
     url: string;
     pageFingerprint: string;
     model: string;
-    variables?: Record<string, string>;
+    variables?: AiVariables;
   }): string {
-    const instruction = redactVariableValues(input.instruction, input.variables);
+    const instruction = redactVariables(input.instruction, input.variables);
     return createHash('sha256')
       .update(JSON.stringify({
         version: CACHE_VERSION,
@@ -62,6 +60,25 @@ export class AiRuntimeCache {
         url: normalizeUrl(input.url),
         pageFingerprint: input.pageFingerprint,
         model: input.model,
+        variableNames: Object.keys(input.variables ?? {}).sort()
+      }))
+      .digest('hex');
+  }
+
+  createAgentKey(input: {
+    instruction: string;
+    url: string;
+    model: string;
+    configSignature: string;
+    variables?: AiVariables;
+  }): string {
+    return createHash('sha256')
+      .update(JSON.stringify({
+        version: CACHE_VERSION,
+        instruction: normalizeInstruction(redactVariables(input.instruction, input.variables)),
+        url: normalizeUrl(input.url),
+        model: input.model,
+        configSignature: input.configSignature,
         variableNames: Object.keys(input.variables ?? {}).sort()
       }))
       .digest('hex');
@@ -97,48 +114,6 @@ export class AiRuntimeCache {
     const temporaryPath = `${filePath}.${process.pid}.tmp`;
     await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
     await rename(temporaryPath, filePath);
-  }
-
-  async getAgentDecision(key: string): Promise<CachedAgentDecision | undefined> {
-    const filePath = this.agentFilePath(key);
-    if (!(await pathExists(filePath))) {
-      return undefined;
-    }
-    try {
-      const value = JSON.parse(await readFile(filePath, 'utf8')) as CachedAgentDecision;
-      if (
-        value.version !== CACHE_VERSION ||
-        value.key !== key ||
-        !Array.isArray(value.toolCalls)
-      ) {
-        return undefined;
-      }
-      return value;
-    } catch {
-      return undefined;
-    }
-  }
-
-  async setAgentDecision(
-    input: Omit<CachedAgentDecision, 'version' | 'createdAt' | 'updatedAt'>
-  ): Promise<void> {
-    await ensureDir(this.rootDir);
-    const existing = await this.getAgentDecision(input.key);
-    const now = new Date().toISOString();
-    const value: CachedAgentDecision = {
-      ...input,
-      version: CACHE_VERSION,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now
-    };
-    const filePath = this.agentFilePath(input.key);
-    const temporaryPath = `${filePath}.${process.pid}.tmp`;
-    await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-    await rename(temporaryPath, filePath);
-  }
-
-  async deleteAgentDecision(key: string): Promise<void> {
-    await unlink(this.agentFilePath(key)).catch(() => undefined);
   }
 
   async getAgentTrajectory(key: string): Promise<CachedAgentTrajectory | undefined> {
@@ -184,10 +159,6 @@ export class AiRuntimeCache {
     return path.join(this.rootDir, `${key}.json`);
   }
 
-  private agentFilePath(key: string): string {
-    return path.join(this.rootDir, `${key}.agent.json`);
-  }
-
   private trajectoryFilePath(key: string): string {
     return path.join(this.rootDir, `${key}.trajectory.json`);
   }
@@ -195,15 +166,9 @@ export class AiRuntimeCache {
 
 export function redactVariableValues(
   input: string,
-  variables?: Record<string, string>
+  variables?: AiVariables
 ): string {
-  return Object.entries(variables ?? {})
-    .filter(([, value]) => value.length > 0)
-    .sort((left, right) => right[1].length - left[1].length)
-    .reduce(
-      (result, [key, value]) => result.split(value).join(`\${${key}}`),
-      input
-    );
+  return redactVariables(input, variables);
 }
 
 function normalizeInstruction(input: string): string {
