@@ -198,6 +198,13 @@ export function buildSnapshot(
     const attributesByIndex = (nodes.nodeName ?? []).map((_, index) =>
       attributesAt(strings, nodes.attributes?.[index])
     );
+    const testIdCounts = new Map<string, number>();
+    for (const attributes of attributesByIndex) {
+      const testId = attributes['data-testid'] ?? attributes['data-test-id'];
+      if (testId) {
+        testIdCounts.set(testId, (testIdCounts.get(testId) ?? 0) + 1);
+      }
+    }
     const scopeRoots = new Set<number>();
     const ignoreRoots = new Set<number>();
     for (const [index, attributes] of attributesByIndex.entries()) {
@@ -239,6 +246,7 @@ export function buildSnapshot(
       const visible = Boolean(bounds && bounds[2] > 0 && bounds[3] > 0 && attributes.hidden === undefined);
       const disabled = attributes.disabled !== undefined || axProperty(axNode, 'disabled') === true;
       const xpath = absoluteXPath(index, nodes, strings);
+      const testId = attributes['data-testid'] ?? attributes['data-test-id'];
       const locators = buildLocators({
         tag,
         role,
@@ -246,7 +254,8 @@ export function buildSnapshot(
         text,
         attributes,
         frameUrl: documentUrl,
-        xpath
+        xpath,
+        preferXpath: Boolean(testId && (testIdCounts.get(testId) ?? 0) > 1)
       });
 
       if (!shouldIncludeNode({ tag, role, name, text, visible, locators })) {
@@ -359,6 +368,7 @@ function buildLocators(input: {
   attributes: Record<string, string>;
   frameUrl?: string;
   xpath?: string;
+  preferXpath?: boolean;
 }): LocatorDescriptor[] {
   const output: LocatorDescriptor[] = [];
   const add = (locator: LocatorDescriptor | undefined): void => {
@@ -369,13 +379,14 @@ function buildLocators(input: {
   };
   const frameUrl = input.frameUrl;
   const testId = input.attributes['data-testid'] ?? input.attributes['data-test-id'];
+  add(input.preferXpath && input.xpath ? { strategy: 'xpath', value: input.xpath, frameUrl } : undefined);
   add(testId ? { strategy: 'testId', value: testId, frameUrl } : undefined);
   add(input.role && input.name ? { strategy: 'role', value: input.role, name: input.name, frameUrl } : undefined);
   add(input.attributes['aria-label'] ? { strategy: 'label', value: input.attributes['aria-label'], frameUrl } : undefined);
   add(input.attributes.placeholder ? { strategy: 'placeholder', value: input.attributes.placeholder, frameUrl } : undefined);
   add(input.text && input.text.length <= 120 ? { strategy: 'text', value: input.text, frameUrl } : undefined);
   add(cssLocator(input.tag, input.attributes, frameUrl));
-  add(input.xpath ? { strategy: 'xpath', value: input.xpath, frameUrl } : undefined);
+  add(!input.preferXpath && input.xpath ? { strategy: 'xpath', value: input.xpath, frameUrl } : undefined);
   return output;
 }
 
@@ -411,12 +422,15 @@ function absoluteXPath(
       }
       let position = 1;
       const parent = nodes.parentIndex?.[current] ?? -1;
-      for (let sibling = 0; sibling < current; sibling += 1) {
-        if (
-          nodes.parentIndex?.[sibling] === parent &&
-          stringAt(strings, nodes.nodeName?.[sibling]).toLowerCase() === tag
-        ) {
-          position += 1;
+      if (parent >= 0) {
+        for (let sibling = 0; sibling < current; sibling += 1) {
+          if (
+            nodes.nodeType?.[sibling] === 1 &&
+            nodes.parentIndex?.[sibling] === parent &&
+            stringAt(strings, nodes.nodeName?.[sibling]).toLowerCase() === tag
+          ) {
+            position += 1;
+          }
         }
       }
       parts.unshift(`${tag}[${position}]`);

@@ -7,6 +7,7 @@ import {
   jsonSchema,
   streamText,
   wrapLanguageModel,
+  zodSchema,
   type LanguageModel,
   type ModelMessage as AiSdkModelMessage,
   type ToolSet
@@ -323,11 +324,16 @@ export class RuntimeModelClient {
     const outputSchema = wrapOutput
       ? z.object({ result: input.schema })
       : input.schema;
+    const promptSchema = mode === 'prompt'
+      ? await zodSchema(outputSchema as z.ZodTypeAny).jsonSchema
+      : undefined;
     const result = await generateText({
       model,
       system: [
         input.system,
-        mode === 'prompt' ? 'Return exactly one JSON value matching the requested schema.' : ''
+        mode === 'prompt'
+          ? `Return exactly one JSON value matching this JSON Schema: ${JSON.stringify(promptSchema)}`
+          : ''
       ].filter(Boolean).join('\n'),
       messages: [{ role: 'user', content: userContent }],
       output: Output.object<unknown>({

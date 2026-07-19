@@ -23,6 +23,9 @@ export type GenerateOptions = {
   baseUrl: string;
   storageState: string;
   ignoreHTTPSErrors: boolean;
+  playwrightTimeoutMs: number;
+  runtimeAiTimeoutMs: number;
+  agentTimeoutMs: number;
   specOut?: string;
   pageObjectOut?: string;
 };
@@ -45,17 +48,14 @@ export function generateTestFiles(plan: ResolvedPlan, kb: CodegenKb, options: Ge
   const className = 'GeneratedCasePage';
   const stepRenders = plan.steps.map((step, index) => renderStep(plan, step, index, kb, options));
   const usesAi = stepRenders.some((step) => step.usesAi);
-  const runtimeImportPath = toImportPath(path.relative(
-    path.dirname(pageObjectPath),
-    path.resolve(options.cwd, 'src/runtime-ai/index.ts')
-  ));
-  const pageObjectSource = renderPageObject(className, stepRenders, usesAi ? runtimeImportPath : undefined);
+  const pageObjectSource = renderPageObject(className, stepRenders, usesAi ? 'vole/runtime-ai' : undefined);
   const specSource = renderSpec(plan, className, stepRenders, {
     pageObjectPath,
     specPath,
     storageState: options.storageState,
     ignoreHTTPSErrors: options.ignoreHTTPSErrors,
-    usesAi
+    usesAi,
+    testTimeoutMs: usesAi ? calculateAiTestTimeout(plan, options) : undefined
   });
 
   return {
@@ -117,6 +117,7 @@ function renderSpec(
     storageState: string;
     ignoreHTTPSErrors: boolean;
     usesAi: boolean;
+    testTimeoutMs?: number;
   }
 ): string {
   const importPath = toImportPath(path.relative(path.dirname(paths.specPath), paths.pageObjectPath));
@@ -127,6 +128,7 @@ function renderSpec(
     `test.use({ storageState: ${quote(paths.storageState)}, ignoreHTTPSErrors: ${String(paths.ignoreHTTPSErrors)} });`,
     '',
     `test(${quote(plan.name)}, async ({ page }) => {`,
+    paths.testTimeoutMs ? `  test.setTimeout(${paths.testTimeoutMs});` : undefined,
     `  const flow = new ${className}(page);`,
     '  const context: Record<string, string> = {};',
     paths.usesAi ? '  try {' : undefined,
@@ -135,6 +137,20 @@ function renderSpec(
     '});',
     ''
   ].filter((line): line is string => line !== undefined).join('\n')}`;
+}
+
+function calculateAiTestTimeout(plan: ResolvedPlan, options: GenerateOptions): number {
+  return plan.steps.reduce((timeout, item) => {
+    if (item.resolution.status !== 'ai_fallback') {
+      return timeout;
+    }
+
+    return timeout + (
+      item.resolution.execution === 'ai-agent'
+        ? options.agentTimeoutMs
+        : options.runtimeAiTimeoutMs * 2
+    );
+  }, options.playwrightTimeoutMs);
 }
 
 function renderStep(plan: ResolvedPlan, resolvedStep: ResolvedStep, index: number, kb: CodegenKb, options: GenerateOptions): StepRender {

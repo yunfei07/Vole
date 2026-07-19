@@ -6,6 +6,12 @@
   "bin": {
     "vole": "dist/cli/index.js"
   },
+  "exports": {
+    "./runtime-ai": {
+      "types": "./dist/runtime-ai/index.d.ts",
+      "import": "./dist/runtime-ai/index.js"
+    }
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli/index.ts",

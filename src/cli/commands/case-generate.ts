@@ -33,6 +33,9 @@ export async function caseGenerateCommand(resolvedPlanPath: string, options: Cas
         baseUrl: config.baseUrl,
         storageState: config.auth.storageState,
         ignoreHTTPSErrors: config.playwright.ignoreHTTPSErrors,
+        playwrightTimeoutMs: config.playwright.timeout,
+        runtimeAiTimeoutMs: config.runtimeAi.timeoutMs,
+        agentTimeoutMs: config.runtimeAi.agent.timeoutMs,
         specOut: options.out,
         pageObjectOut: options.pageObjectOut
       }

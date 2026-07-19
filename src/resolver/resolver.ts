@@ -93,6 +93,17 @@ function resolveFromCandidates(
   }
 
   if (sorted.length > 1 && sorted[0] && sorted[1] && sorted[0].confidence - sorted[1].confidence < 0.12) {
+    if (fallback) {
+      return {
+        status: 'ai_fallback',
+        execution: fallback,
+        stepId: step.id,
+        target: step.target ?? '',
+        candidates: sorted.slice(0, 5),
+        reason: 'Static knowledge-base candidates are ambiguous; using AI runtime'
+      };
+    }
+
     return {
       status: 'ambiguous',
       execution: 'static',
