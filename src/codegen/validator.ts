@@ -1,8 +1,8 @@
 import { spawn } from 'node:child_process';
-import path from 'node:path';
+import { createRequire } from 'node:module';
 
 export async function validateGeneratedTypescript(cwd: string, files: string[]): Promise<void> {
-  const tscPath = path.resolve(cwd, 'node_modules/typescript/bin/tsc');
+  const tscPath = createRequire(import.meta.url).resolve('typescript/bin/tsc');
   const args = [
     tscPath,
     '--noEmit',

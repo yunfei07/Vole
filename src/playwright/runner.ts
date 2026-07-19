@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { ensureDir, pathExists } from '../utils/fs.js';
 
@@ -72,7 +73,7 @@ export async function runPlaywrightSpec(
 }
 
 function runCommand(cwd: string, specPath: string, reportPath: string): Promise<number> {
-  const cliPath = path.resolve(cwd, 'node_modules/@playwright/test/cli.js');
+  const cliPath = createRequire(import.meta.url).resolve('@playwright/test/cli');
   const args = [cliPath, 'test', specPath, '--reporter=json'];
 
   return new Promise((resolve, reject) => {
