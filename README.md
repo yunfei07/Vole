@@ -32,6 +32,7 @@ node dist/cli/index.js init
 
 ```text
 .vole/
+  vole.config.json
   ai-cache/
   auth/
   artifacts/
@@ -42,6 +43,7 @@ node dist/cli/index.js init
 cases/
 pages/
 tests/generated/
+playwright.config.ts
 ```
 
 配置模型 API Key：
