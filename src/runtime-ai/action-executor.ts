@@ -1,6 +1,6 @@
 import type { CDPSession, Frame, Locator, Page } from '@playwright/test';
-import { runtimeError } from './errors.js';
-import type { LocatorDescriptor } from './types.js';
+import { BackendResolutionError, runtimeError } from './errors.js';
+import { ACTION_METHODS, type LocatorDescriptor } from './types.js';
 
 export class ActionExecutor {
   private readonly sessions = new Map<number, CDPSession>();
@@ -492,8 +492,7 @@ export class ActionExecutor {
         previousError = error;
       }
     }
-    throw runtimeError(
-      'AI_ACT_FAILED',
+    throw new BackendResolutionError(
       `Unable to resolve backend node ${backendNodeId}`,
       previousError instanceof Error ? previousError.message : previousError
     );
@@ -834,26 +833,7 @@ export class ActionExecutor {
   }
 }
 
-const SUPPORTED_ACTIONS = new Set([
-  'click',
-  'tap',
-  'fill',
-  'type',
-  'selectOption',
-  'selectOptionFromDropdown',
-  'setInputFiles',
-  'press',
-  'hover',
-  'doubleClick',
-  'scrollIntoView',
-  'scrollByPixelOffset',
-  'scroll',
-  'scrollTo',
-  'mouse.wheel',
-  'nextChunk',
-  'prevChunk',
-  'dragAndDrop'
-]);
+export const SUPPORTED_ACTIONS: ReadonlySet<string> = new Set(ACTION_METHODS);
 
 function deepLocator(scope: Page | Frame, selector: string): Locator {
   const parts = selector
@@ -927,5 +907,5 @@ function withoutBackendNodeId(descriptor: LocatorDescriptor): LocatorDescriptor 
 }
 
 function isBackendResolutionError(error: unknown): boolean {
-  return error instanceof Error && error.message.includes('Unable to resolve backend node');
+  return error instanceof BackendResolutionError;
 }

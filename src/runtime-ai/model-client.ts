@@ -14,7 +14,7 @@ import {
 } from 'ai';
 import { z } from 'zod';
 import type { VoleConfig } from '../config/schema.js';
-import { runtimeError } from './errors.js';
+import { AiRuntimeError, isCancellation, runtimeError } from './errors.js';
 import type { RuntimeModelUsage } from './types.js';
 
 export type ModelMessage = {
@@ -79,12 +79,11 @@ type ModelClientOptions = {
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 type ProviderOptions = Record<string, Record<string, JsonValue>>;
 
-const promptModeModels = new Set<string>();
-
 export class RuntimeModelClient {
   private readonly nativeProvider;
   private readonly promptProvider;
   private readonly callHistory: ModelCallLog[] = [];
+  private readonly promptModeModels = new Set<string>();
 
   constructor(
     private readonly config: VoleConfig,
@@ -130,7 +129,7 @@ export class RuntimeModelClient {
     const configuredMode = this.config.ai.structuredOutputMode;
     const cacheKey = `${this.config.ai.baseURL}:${modelName}`;
     const preferredMode = configuredMode === 'auto'
-      ? (promptModeModels.has(cacheKey) ? 'prompt' : 'native')
+      ? (this.promptModeModels.has(cacheKey) ? 'prompt' : 'native')
       : configuredMode;
 
     try {
@@ -153,7 +152,7 @@ export class RuntimeModelClient {
       ) {
         throw mapModelError(error, input.purpose);
       }
-      promptModeModels.add(cacheKey);
+      this.promptModeModels.add(cacheKey);
       try {
         const result = await this.runObject(input, modelName, 'prompt');
         this.record({
@@ -507,7 +506,7 @@ function mapModelError(error: unknown, purpose: string): Error {
   if (error instanceof Error && error.name === 'AbortError') {
     return runtimeError('AI_RUNTIME_TIMEOUT', `${purpose}: model request was aborted or timed out`);
   }
-  if (error instanceof Error && error.message.startsWith('AI_')) {
+  if (error instanceof AiRuntimeError) {
     return error;
   }
   return runtimeError(
@@ -516,14 +515,14 @@ function mapModelError(error: unknown, purpose: string): Error {
   );
 }
 
-function isCancellation(error: unknown): boolean {
-  return error instanceof Error &&
-    (error.name === 'AbortError' || /abort|timeout/iu.test(error.message));
-}
-
 function shouldFallbackToPrompt(error: unknown): boolean {
-  const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
-  return /structured|response.?format|json.?schema|schema validation|no object|invalid json/iu.test(message);
+  if (error instanceof Error) {
+    if (/NoObjectGenerated|TypeValidation|StructuredOutput|ResponseFormat|JSONSchema/iu.test(error.name)) {
+      return true;
+    }
+    return /structured|response.?format|json.?schema|schema validation|no object|invalid json/iu.test(error.message);
+  }
+  return false;
 }
 
 function parseJson(value: string): unknown {

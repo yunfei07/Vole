@@ -25,25 +25,37 @@ export type AiVariableValue =
 
 export type AiVariables = Record<string, AiVariableValue>;
 
-export type AiActionMethod =
-  | 'click'
-  | 'tap'
-  | 'fill'
-  | 'type'
-  | 'selectOption'
-  | 'selectOptionFromDropdown'
-  | 'setInputFiles'
-  | 'press'
-  | 'hover'
-  | 'doubleClick'
-  | 'scrollTo'
-  | 'nextChunk'
-  | 'prevChunk'
-  | 'dragAndDrop'
-  | 'scrollIntoView'
-  | 'scrollByPixelOffset'
-  | 'scroll'
-  | 'mouse.wheel';
+/**
+ * Every action method the executor can perform. This tuple is the single
+ * source of truth: the AiActionMethod union, the executor's SUPPORTED_ACTIONS
+ * set, and any per-method dispatch all derive from it.
+ *
+ * The model-facing act/observe schema only exposes a subset (the "inference"
+ * methods declared in runtime.ts); the remaining entries are reached via
+ * deterministic AiAction input (e.g. a caller-supplied setInputFiles).
+ */
+export const ACTION_METHODS = [
+  'click',
+  'tap',
+  'fill',
+  'type',
+  'selectOption',
+  'selectOptionFromDropdown',
+  'setInputFiles',
+  'press',
+  'hover',
+  'doubleClick',
+  'scrollIntoView',
+  'scrollByPixelOffset',
+  'scroll',
+  'scrollTo',
+  'mouse.wheel',
+  'nextChunk',
+  'prevChunk',
+  'dragAndDrop'
+] as const;
+
+export type AiActionMethod = (typeof ACTION_METHODS)[number];
 
 export type LocatorDescriptor = {
   strategy: 'testId' | 'role' | 'label' | 'placeholder' | 'text' | 'css' | 'xpath';

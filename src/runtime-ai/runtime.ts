@@ -15,9 +15,9 @@ import { loadConfig } from '../config/load-config.js';
 import type { VoleConfig } from '../config/schema.js';
 import { waitForDomNetworkQuiet, waitForPageReady } from '../playwright/page-readiness.js';
 import { ensureDir } from '../utils/fs.js';
-import { ActionExecutor } from './action-executor.js';
+import { ActionExecutor, SUPPORTED_ACTIONS } from './action-executor.js';
 import { AiRuntimeCache, redactVariableValues } from './cache.js';
-import { AiRuntimeError, runtimeError } from './errors.js';
+import { AiRuntimeError, isCancellation, runtimeError } from './errors.js';
 import {
   RuntimeModelClient,
   type ModelObjectResult
@@ -52,7 +52,14 @@ import type {
   SnapshotNode
 } from './types.js';
 
-const actionMethodSchema = z.enum([
+/**
+ * The subset of ACTION_METHODS the model may choose from during act/observe
+ * inference. Both the validation schema and the prompt text derive from this
+ * tuple so they cannot drift apart. Methods that need caller-supplied data
+ * (e.g. setInputFiles) or are low-level primitives are intentionally excluded
+ * and reached only via deterministic AiAction input.
+ */
+const INFERENCE_ACTION_METHODS = [
   'click',
   'fill',
   'type',
@@ -64,7 +71,9 @@ const actionMethodSchema = z.enum([
   'nextChunk',
   'prevChunk',
   'dragAndDrop'
-]);
+] as const satisfies readonly AiActionMethod[];
+
+const actionMethodSchema = z.enum(INFERENCE_ACTION_METHODS);
 
 const observeResponseSchema = z.object({
   candidates: z.array(z.object({
@@ -1180,8 +1189,15 @@ export class AiRuntime {
           fromCache: true,
           selfHealed: results.some((result) => result.selfHealed)
         };
-      } catch {
-        // The DOM changed. Fall through to semantic act so the trajectory can heal.
+      } catch (error) {
+        // Only a DOM/stale-locator failure should fall through to semantic act.
+        // Abort, timeout, and unrelated runtime errors must propagate.
+        if (isCancellation(error)) {
+          throw error;
+        }
+        if (error instanceof AiRuntimeError && error.code !== 'AI_ACT_FAILED') {
+          throw error;
+        }
       }
     }
     const healed = await this.executeAgentTool('act', toolInput, input, config, executionModel);
@@ -1936,29 +1952,8 @@ function isAiAction(value: unknown): value is AiAction {
   );
 }
 
-const supportedActionMethods = new Set<AiActionMethod>([
-  'click',
-  'tap',
-  'fill',
-  'type',
-  'selectOption',
-  'selectOptionFromDropdown',
-  'setInputFiles',
-  'press',
-  'hover',
-  'doubleClick',
-  'scrollIntoView',
-  'scrollByPixelOffset',
-  'scroll',
-  'scrollTo',
-  'mouse.wheel',
-  'nextChunk',
-  'prevChunk',
-  'dragAndDrop'
-]);
-
 function isSupportedActionMethod(value: string): value is AiActionMethod {
-  return supportedActionMethods.has(value as AiActionMethod);
+  return SUPPORTED_ACTIONS.has(value);
 }
 
 type NormalizedActionPlan = {
@@ -2009,20 +2004,6 @@ function normalizeActionPlan(value: unknown): NormalizedActionPlan | undefined {
   };
 }
 
-const inferenceActionMethods: AiActionMethod[] = [
-  'click',
-  'fill',
-  'type',
-  'press',
-  'scrollTo',
-  'nextChunk',
-  'prevChunk',
-  'selectOptionFromDropdown',
-  'hover',
-  'doubleClick',
-  'dragAndDrop'
-];
-
 function buildActSystemPrompt(): string {
   return [
     'You are the element resolver for Vole: given a natural-language action and a hybrid DOM and accessibility snapshot of the page, decide which single element the action should target.',
@@ -2039,7 +2020,7 @@ function buildActPrompt(
 ): string {
   const supported = input.action
     ? [input.action]
-    : inferenceActionMethods;
+    : INFERENCE_ACTION_METHODS;
   const variableNames = variablePromptEntries(variables)
     .map(({ name }) => `%${name}%`);
   const variablePrompt = variableNames.length > 0
@@ -2090,7 +2071,7 @@ The original instruction was: ${originalInstruction}.
 Step 1 of 2 is complete: method ${previousAction.method}; ${previousAction.description}; arguments ${(previousAction.arguments ?? []).join(', ')}.
 
 Now resolve the single element and action that finish step 2 of 2.
-Pick a method from: ${inferenceActionMethods
+Pick a method from: ${INFERENCE_ACTION_METHODS
     .filter((method) => method !== 'selectOptionFromDropdown')
     .join(', ')}.
 Do not propose another two-step plan.
