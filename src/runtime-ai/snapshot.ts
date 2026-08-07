@@ -703,6 +703,33 @@ function isWithin(index: number, roots: Set<number>, parents: number[] | undefin
   return false;
 }
 
+const INTERACTIVE_TAGS = new Set([
+  'a',
+  'button',
+  'iframe',
+  'input',
+  'select',
+  'textarea',
+  'option',
+  'summary'
+]);
+
+const INTERACTIVE_ROLES = new Set([
+  'button',
+  'checkbox',
+  'combobox',
+  'link',
+  'menuitem',
+  'option',
+  'radio',
+  'searchbox',
+  'slider',
+  'spinbutton',
+  'switch',
+  'tab',
+  'textbox'
+]);
+
 function shouldIncludeNode(input: {
   tag: string;
   role?: string;
@@ -717,36 +744,11 @@ function shouldIncludeNode(input: {
   if (!input.visible) {
     return false;
   }
-  const interactiveTags = new Set([
-    'a',
-    'button',
-    'iframe',
-    'input',
-    'select',
-    'textarea',
-    'option',
-    'summary'
-  ]);
-  const interactiveRoles = new Set([
-    'button',
-    'checkbox',
-    'combobox',
-    'link',
-    'menuitem',
-    'option',
-    'radio',
-    'searchbox',
-    'slider',
-    'spinbutton',
-    'switch',
-    'tab',
-    'textbox'
-  ]);
   if (input.structural) return input.structuralChildCount > 1;
   return (
     input.scrollable ||
-    interactiveTags.has(input.tag) ||
-    (input.role ? interactiveRoles.has(input.role) : false) ||
+    INTERACTIVE_TAGS.has(input.tag) ||
+    (input.role ? INTERACTIVE_ROLES.has(input.role) : false) ||
     Boolean(input.name || input.text)
   );
 }

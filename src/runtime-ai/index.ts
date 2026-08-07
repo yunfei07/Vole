@@ -3,7 +3,6 @@ export { AiRuntimeError, type AiRuntimeErrorCode } from './errors.js';
 export { buildSnapshot, PageSnapshotter } from './snapshot.js';
 export { ActionExecutor } from './action-executor.js';
 export {
-  flattenVariables,
   redactVariables,
   resolveVariableValue,
   substituteVariables,

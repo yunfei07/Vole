@@ -18,18 +18,6 @@ export function variablePromptEntries(
   }));
 }
 
-export function flattenVariables(variables?: AiVariables): Record<string, string> | undefined {
-  if (!variables || Object.keys(variables).length === 0) {
-    return undefined;
-  }
-  return Object.fromEntries(
-    Object.entries(variables).map(([name, value]) => [
-      name,
-      resolveVariableValue(value)
-    ])
-  );
-}
-
 export function substituteVariables(value: string, variables?: AiVariables): string {
   let result = value;
   for (const [name, variable] of Object.entries(variables ?? {})) {
