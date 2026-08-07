@@ -116,7 +116,7 @@ await this.ai.agent({
 });
 ```
 
-也支持 Stagehand 风格调用：
+也支持细粒度调用：
 
 ```ts
 const actions = await this.ai.observe('找到提交按钮');
@@ -133,13 +133,23 @@ const agent = this.ai.agent({ mode: 'dom' });
 await agent.execute('完成订单审批并验证结果');
 ```
 
-`act`、`observe` 和 Agent 支持 Stagehand 的 `%variableName%` 占位符；变量既可传
+`act`、`observe` 和 Agent 支持 `%variableName%` 占位符；变量既可传
 字符串，也可传 `{ value, description }`。`observe` 返回的 Action 可直接传给
-`act`，执行失败时会基于新 Snapshot 做一次自愈。
+`act`。执行失败时会基于新 Snapshot 只修复 selector，原 method 和 arguments
+保持不变。
 
-底层使用当前 Playwright Page 的 Chromium CDP Session 合并 DOM Snapshot 与 Accessibility Tree。元素 ID 使用 `frameOrdinal-backendNodeId`；selector scope、ignored subtree、iframe 和开放 shadow DOM 均在 Snapshot 阶段处理。动作仍由 Playwright Locator 执行，保留 auto-wait、actionability check 和 trace。
+底层使用当前 Playwright Page 的 Chromium CDP Session 合并分层 DOM Snapshot
+与 Accessibility Tree。元素 ID 使用 `frameOrdinal-backendNodeId`；selector
+scope、ignored subtree、同进程/跨进程 iframe，以及开放/关闭 shadow DOM
+均在 Snapshot 和深 XPath 阶段处理。动作优先通过 backend node 和 CDP 执行，
+无法解析 backend node 时才回退到 Playwright Locator。
 
-Agent 使用 AI SDK `ToolLoopAgent` 和 Stagehand DOM 工具协议（act、ariaTree、extract、fillForm、goto、keys、navback、screenshot、scroll、think、wait、done），支持非流式/流式实例、callbacks、自定义 tools、messages continuation、Zod output、usage 与 evidence。默认最大 8 步、总超时 120 秒并限制同源导航。缓存和运行产物分别位于 `.vole/ai-cache` 和 `.vole/artifacts/ai`。
+`act` 的结构化 Action、下拉框两阶段动作、DOM diff、总超时、逐动作缓存重放和
+selector-only 自愈为 Vole 自研实现。Snapshot scope 使用只读 selector/XPath
+解析，不向业务 DOM 写临时属性；未命中时回退到完整页面树。模型输入树采用 Vole 的
+AX outline 格式（`[elementId] role: name` 缩进大纲）。
+
+Agent 基于 AI SDK `ToolLoopAgent` 与 Vole 自研 DOM 工具集（act、ariaTree、extract、fillForm、goto、keys、navback、screenshot、scroll、think、wait、done），支持非流式/流式实例、callbacks、自定义 tools、messages continuation、Zod output、usage 与 evidence。默认最大 8 步、总超时 120 秒并限制同源导航。缓存和运行产物分别位于 `.vole/ai-cache` 和 `.vole/artifacts/ai`。
 
 关闭 `runtimeAi.enabled` 后，零匹配步骤恢复为 unresolved，静态生成行为不变。
 
@@ -151,7 +161,9 @@ npm run test:runtime-ai
 VOLE_LIVE_AI=1 npm run test:live-ai
 ```
 
-测试覆盖 Resolver fallback、生成代码、真实 Chromium CDP DOM/AX（iframe、Shadow DOM、scope）、敏感值清理、Action/trajectory 缓存、四项 Runtime 编排、数据库迁移和原有静态路径。
+测试覆盖 Resolver fallback、生成代码、真实 Chromium CDP DOM/AX（同进程与
+跨站 iframe、开放与关闭 Shadow DOM、scope）、动作矩阵、敏感值清理、
+Action/trajectory 缓存、四项 Runtime 编排、数据库迁移和原有静态路径。
 
 更多信息：
 

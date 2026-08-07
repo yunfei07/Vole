@@ -1,30 +1,10 @@
 # Third-Party Notices
 
-Vole's AI Runtime design and portions of its browser automation behavior were informed by the Stagehand project.
+Vole is original work by the Vole project. Its AI Runtime — including the prompt
+design, the DOM/AX snapshot pipeline, the action and agent orchestration, and the
+caching/self-healing logic — is authored and maintained by the Vole project.
 
-Behavioral reference: Stagehand commit
-`06289148e4193d67371f07bd80a58e3268520260`.
-
-## Stagehand
-
-Copyright (c) 2024 Browserbase Inc.
-
-MIT License
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Vole uses third-party packages via npm (for example Playwright, the Vercel AI SDK,
+Zod, better-sqlite3, and Commander). Those packages are consumed as dependencies
+and retain their respective upstream licenses; no third-party source code is
+vendored or copied into this repository.

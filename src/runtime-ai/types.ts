@@ -27,6 +27,7 @@ export type AiVariables = Record<string, AiVariableValue>;
 
 export type AiActionMethod =
   | 'click'
+  | 'tap'
   | 'fill'
   | 'type'
   | 'selectOption'
@@ -38,7 +39,11 @@ export type AiActionMethod =
   | 'scrollTo'
   | 'nextChunk'
   | 'prevChunk'
-  | 'dragAndDrop';
+  | 'dragAndDrop'
+  | 'scrollIntoView'
+  | 'scrollByPixelOffset'
+  | 'scroll'
+  | 'mouse.wheel';
 
 export type LocatorDescriptor = {
   strategy: 'testId' | 'role' | 'label' | 'placeholder' | 'text' | 'css' | 'xpath';
@@ -46,6 +51,7 @@ export type LocatorDescriptor = {
   name?: string;
   frameUrl?: string;
   frameOrdinal?: number;
+  backendNodeId?: number;
 };
 
 export type SnapshotNode = {
@@ -55,15 +61,22 @@ export type SnapshotNode = {
   role?: string;
   name?: string;
   value?: string;
+  description?: string;
   text?: string;
   attributes: Record<string, string>;
   visible: boolean;
   disabled: boolean;
+  selected?: boolean;
+  checked?: boolean;
+  focused?: boolean;
+  scrollable?: boolean;
   frameUrl?: string;
   bounds?: [number, number, number, number];
   locators: LocatorDescriptor[];
   xpath?: string;
   href?: string;
+  parentElementId?: string;
+  depth?: number;
 };
 
 export type PageSnapshot = {
@@ -80,7 +93,7 @@ export type PageSnapshot = {
 export type AiAction = {
   selector: string;
   description: string;
-  method?: AiActionMethod;
+  method?: string;
   arguments?: string[];
   locator?: LocatorDescriptor;
 };

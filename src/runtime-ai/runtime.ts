@@ -13,7 +13,7 @@ import {
 import { z } from 'zod';
 import { loadConfig } from '../config/load-config.js';
 import type { VoleConfig } from '../config/schema.js';
-import { waitForPageReady } from '../playwright/page-readiness.js';
+import { waitForDomNetworkQuiet, waitForPageReady } from '../playwright/page-readiness.js';
 import { ensureDir } from '../utils/fs.js';
 import { ActionExecutor } from './action-executor.js';
 import { AiRuntimeCache, redactVariableValues } from './cache.js';
@@ -48,16 +48,15 @@ import type {
   AiVariables,
   ExtractSchema,
   LocatorDescriptor,
-  PageSnapshot
+  PageSnapshot,
+  SnapshotNode
 } from './types.js';
 
 const actionMethodSchema = z.enum([
   'click',
   'fill',
   'type',
-  'selectOption',
   'selectOptionFromDropdown',
-  'setInputFiles',
   'press',
   'hover',
   'doubleClick',
@@ -78,11 +77,13 @@ const observeResponseSchema = z.object({
 });
 
 const actionPlanSchema = z.object({
-  elementId: z.string().min(1).nullable(),
-  method: actionMethodSchema,
-  arguments: z.array(z.string()).default([]),
-  reasoning: z.string().default(''),
-  twoStep: z.boolean().default(false)
+  action: z.object({
+    elementId: z.string().regex(/^\d+-\d+$/u),
+    description: z.string().min(1),
+    method: actionMethodSchema,
+    arguments: z.array(z.string())
+  }).nullable(),
+  twoStep: z.boolean()
 });
 
 const assertExtractSchema = z.object({
@@ -114,6 +115,7 @@ export class AiRuntime {
   private executor?: ActionExecutor;
   private model?: RuntimeModel;
   private cache?: AiRuntimeCache;
+  private latestSnapshot?: PageSnapshot;
 
   constructor(
     private readonly page: Page,
@@ -159,7 +161,7 @@ export class AiRuntime {
     });
 
     const candidates = response.value.candidates.flatMap((candidate) => {
-      const node = snapshot.nodes.find((item) => item.elementId === candidate.elementId);
+      const node = actionableSnapshotNode(snapshot, candidate.elementId);
       const locator = node?.locators[0];
       if (!node || !locator) {
         return [];
@@ -167,9 +169,7 @@ export class AiRuntime {
       const argumentsWithResolvedTargets = candidate.method === 'dragAndDrop' &&
         candidate.arguments?.[0]
         ? (() => {
-            const target = snapshot.nodes.find(
-              (item) => item.elementId === candidate.arguments[0]
-            );
+            const target = actionableSnapshotNode(snapshot, candidate.arguments[0]);
             const targetLocator = target?.locators[0];
             return targetLocator
               ? [this.getExecutor().selector(targetLocator), ...candidate.arguments.slice(1)]
@@ -274,7 +274,18 @@ export class AiRuntime {
     options: AiActOptions = {}
   ): Promise<AiActResult> {
     if (isAiAction(rawInput)) {
-      return this.replayActionWithHealing(rawInput, options);
+      const config = await this.config();
+      const deadline = createActDeadline(options.timeoutMs ?? config.runtimeAi.timeoutMs);
+      return this.takeDeterministicAction(rawInput, options, deadline);
+    }
+    if (
+      (typeof rawInput === 'string' && !rawInput.trim()) ||
+      (typeof rawInput === 'object' && !rawInput.instruction?.trim())
+    ) {
+      throw runtimeError(
+        'AI_ACT_FAILED',
+        'act(): instruction string is required unless passing an Action'
+      );
     }
     const input: AiActInput = typeof rawInput === 'string'
       ? {
@@ -289,7 +300,10 @@ export class AiRuntime {
       : rawInput;
     const config = await this.config();
     const timeoutMs = input.timeoutMs ?? config.runtimeAi.timeoutMs;
+    const deadline = createActDeadline(timeoutMs);
+    deadline.ensure();
     const firstSnapshot = await this.snapshot();
+    deadline.ensure();
     const cache = this.getCache(config);
     const cacheInstruction = redactVariableValues(input.instruction, input.variables);
     const useCache = input.cache ?? options.cache ?? true;
@@ -302,107 +316,85 @@ export class AiRuntime {
     });
     const cached = useCache ? await cache.get(key) : undefined;
 
-    if (
-      cached &&
-      (!input.action || cached.action === input.action) &&
-      await this.getExecutor().isUsable(cached.locator)
-    ) {
-      try {
-        const cachedActions = transformActionVariables(
-          cached.actions ?? [{
-            selector: this.getExecutor().selector(cached.locator),
-            description: input.instruction,
-            method: cached.action,
-            arguments: []
-          }],
-          input.variables,
-          'hydrate'
+    if (cached && (!input.action || cached.action === input.action)) {
+      const cachedActions = transformActionVariables(
+        cached.actions ?? [{
+          selector: this.getExecutor().selector(cached.locator),
+          description: input.instruction,
+          method: cached.action,
+          arguments: []
+        }],
+        input.variables,
+        'hydrate'
+      );
+      const replayResults: AiActResult[] = [];
+      for (const cachedAction of cachedActions) {
+        deadline.ensure();
+        const replayed = await this.takeDeterministicAction(
+          cachedAction,
+          {
+            ...options,
+            variables: input.variables,
+            model: input.model,
+            timeoutMs: deadline.remaining(),
+            abortSignal: input.abortSignal,
+            providerOptions: input.providerOptions
+          },
+          deadline,
+          input.filePath
         );
-        for (const [index, cachedAction] of cachedActions.entries()) {
-          await this.getExecutor().execute({
-            method: cachedAction.method ?? cached.action,
-            locator: cachedAction.locator ??
-              this.getExecutor().descriptorFromSelector(cachedAction.selector),
-            value: substituteVariables(
-              input.value ?? cachedAction.arguments?.[0] ?? '',
-              input.variables
-            ),
-            filePath: input.filePath,
-            targetLocator: cachedAction.method === 'dragAndDrop' && cachedAction.arguments?.[0]
-              ? this.getExecutor().descriptorFromSelector(
-                  substituteVariables(cachedAction.arguments[0], input.variables)
-                )
-              : undefined,
-            timeoutMs
-          });
-          if (index < cachedActions.length - 1) {
-            await this.page.waitForTimeout(100);
-          }
+        replayResults.push(replayed);
+        if (!replayed.success) {
+          break;
         }
+      }
+      if (replayResults.length > 0 && replayResults.every((result) => result.success)) {
+        const replayedActions = replayResults.flatMap((result) => result.actions);
         const result: AiActResult = {
           success: true,
-          message: 'Action completed from cache',
+          message: replayResults.map((item) => item.message).join(' → '),
           actionDescription: cached.actions?.[0]?.description ?? input.instruction,
-          actions: cachedActions,
-          action: cached.action,
-          locator: cached.locator,
+          actions: replayedActions,
+          action: replayResults.at(-1)?.action ?? cached.action,
+          locator: replayResults.at(-1)?.locator ?? cached.locator,
           fromCache: true,
-          selfHealed: false,
+          selfHealed: replayResults.some((item) => item.selfHealed),
           cacheStatus: 'HIT'
         };
-        await this.tryArtifact('act', { input, result });
-        return result;
-      } catch {
-        // A fresh snapshot and model plan below provide one self-healing attempt.
-      }
-    }
-
-    try {
-      const result = await this.planAndExecute(input, firstSnapshot, timeoutMs);
-      if (useCache && result.success && result.action && result.locator) {
-        await cache.set({
-          key,
-          instruction: cacheInstruction,
-          url: firstSnapshot.url,
-          pageFingerprint: firstSnapshot.fingerprint,
-          model: input.model ?? config.runtimeAi.model ?? config.ai.model,
-          variableNames: Object.keys(input.variables ?? {}).sort(),
-          action: result.action,
-          locator: result.locator,
-          actions: transformActionVariables(result.actions, input.variables, 'template')
-        }).catch(() => undefined);
-      }
-      await this.tryArtifact('act', { input, result });
-      return result;
-    } catch (firstError) {
-      if (!config.runtimeAi.selfHeal) {
-        throw this.wrapActError(firstError);
-      }
-      try {
-        const freshSnapshot = await this.snapshot();
-        const result = await this.planAndExecute(input, freshSnapshot, timeoutMs);
-        const healed = { ...result, selfHealed: true };
-        if (useCache && healed.success && healed.action && healed.locator) {
+        if (actionsChanged(cachedActions, replayedActions)) {
           await cache.set({
             key,
             instruction: cacheInstruction,
-            url: freshSnapshot.url,
-            pageFingerprint: freshSnapshot.fingerprint,
+            url: firstSnapshot.url,
+            pageFingerprint: firstSnapshot.fingerprint,
             model: input.model ?? config.runtimeAi.model ?? config.ai.model,
             variableNames: Object.keys(input.variables ?? {}).sort(),
-            action: healed.action,
-            locator: healed.locator,
-            actions: transformActionVariables(healed.actions, input.variables, 'template')
+            action: result.action ?? cached.action,
+            locator: result.locator ?? cached.locator,
+            actions: transformActionVariables(replayedActions, input.variables, 'template')
           }).catch(() => undefined);
         }
-        await this.tryArtifact('act', { input, result: healed });
-        return healed;
-      } catch (secondError) {
-        const error = this.wrapActError(secondError, firstError);
-        await this.tryArtifact('act-failed', { input, error: error.message });
-        throw error;
+        await this.tryArtifact('act', { input, result });
+        return result;
       }
     }
+
+    const result = await this.planAndExecute(input, firstSnapshot, deadline);
+    if (useCache && result.success && result.action && result.locator) {
+      await cache.set({
+        key,
+        instruction: cacheInstruction,
+        url: firstSnapshot.url,
+        pageFingerprint: firstSnapshot.fingerprint,
+        model: input.model ?? config.runtimeAi.model ?? config.ai.model,
+        variableNames: Object.keys(input.variables ?? {}).sort(),
+        action: result.action,
+        locator: result.locator,
+        actions: transformActionVariables(result.actions, input.variables, 'template')
+      }).catch(() => undefined);
+    }
+    await this.tryArtifact('act', { input, result });
+    return result;
   }
 
   async assert(input: AiAssertInput): Promise<AiAssertResult> {
@@ -1169,16 +1161,24 @@ export class AiRuntime {
       try {
         const results: AiActResult[] = [];
         for (const action of actions) {
-          results.push(await this.replayAction(action, {
+          const deadline = createActDeadline(config.runtimeAi.timeoutMs);
+          const result = await this.takeDeterministicAction(action, {
             variables: input.variables,
-            model: executionModel
-          }));
+            model: executionModel,
+            timeoutMs: config.runtimeAi.timeoutMs,
+            abortSignal: input.abortSignal,
+            providerOptions: input.providerOptions
+          }, deadline);
+          results.push(result);
+          if (!result.success) {
+            throw runtimeError('AI_ACT_FAILED', result.message);
+          }
         }
         return {
           success: results.every((result) => result.success),
           actions: results.flatMap((result) => result.actions),
           fromCache: true,
-          selfHealed: false
+          selfHealed: results.some((result) => result.selfHealed)
         };
       } catch {
         // The DOM changed. Fall through to semantic act so the trajectory can heal.
@@ -1246,42 +1246,31 @@ export class AiRuntime {
 
   async close(): Promise<void> {
     await this.snapshotter?.close();
+    await this.executor?.close();
   }
 
   private async planAndExecute(
     input: AiActInput,
     snapshot: PageSnapshot,
-    timeoutMs: number
+    deadline: ActDeadline
   ): Promise<AiActResult> {
     const config = await this.config();
+    deadline.ensure();
     const response = await this.completeObject<z.infer<typeof actionPlanSchema>>(config, {
       purpose: 'act',
-      system: [
-        'Choose one element and one safe browser action from the DOM/accessibility snapshot.',
-        'Use an elementId that appears in the snapshot.',
-        input.action ? `The method must be ${input.action}.` : '',
-        'Do not invent user values or file paths.'
-      ].filter(Boolean).join(' '),
-      user: {
-        instruction: input.instruction,
-        requestedAction: input.action,
-        target: input.target,
-        hasValue: input.value !== undefined,
-        hasFilePath: input.filePath !== undefined,
-        variables: variablePromptEntries(input.variables).map(({ name, description }) => ({
-          placeholder: `%${name}%`,
-          description
-        })),
-        snapshot: snapshot.text
-      },
+      system: buildActSystemPrompt(),
+      user: buildActUserPrompt(
+        buildActPrompt(input, input.variables),
+        snapshot.text
+      ),
       schema: actionPlanSchema,
-      timeoutMs,
+      timeoutMs: deadline.remaining(),
       abortSignal: input.abortSignal,
       providerOptions: input.providerOptions,
       model: input.model
     });
-    const plan = response.value;
-    if (!plan.elementId) {
+    const plan = normalizeActionPlan(response.value);
+    if (!plan?.elementId) {
       return {
         success: false,
         message: 'Failed to perform act: No action found',
@@ -1293,180 +1282,286 @@ export class AiRuntime {
         usage: response.usage
       };
     }
-    const node = snapshot.nodes.find((item) => item.elementId === plan.elementId);
+    const node = actionableSnapshotNode(snapshot, plan.elementId);
     const locator = node?.locators[0];
     if (!node || !locator) {
       throw runtimeError('AI_ACT_FAILED', `model selected unknown or unlocatable element ${plan.elementId}`);
     }
-    const action = input.action ?? plan.method;
+    const method = input.action ?? plan.method;
     if (input.action && plan.method !== input.action) {
       throw runtimeError(
         'AI_ACT_FAILED',
         `model returned method ${plan.method}, expected ${input.action}`
       );
     }
-    const dragTargetNode = action === 'dragAndDrop'
-      ? snapshot.nodes.find((item) => item.elementId === plan.arguments?.[0])
+    const dragTargetNode = method === 'dragAndDrop'
+      ? actionableSnapshotNode(snapshot, plan.arguments?.[0])
       : undefined;
     const dragTargetLocator = dragTargetNode?.locators[0];
-    await this.getExecutor().execute({
-      method: action,
-      locator,
-      value: substituteVariables(input.value ?? plan.arguments?.[0] ?? '', input.variables),
-      filePath: input.filePath,
-      targetLocator: dragTargetLocator,
-      timeoutMs
-    });
-    const description = plan.reasoning || input.instruction;
-    const actions: AiAction[] = [{
-      selector: this.getExecutor().selector(locator),
+    const description = plan.description || input.instruction;
+    const firstAction: AiAction = {
+      selector: node.xpath
+        ? `xpath=${node.xpath}`
+        : this.getExecutor().selector(locator),
       description,
-      method: action,
+      method,
       locator,
-      arguments: action === 'dragAndDrop' && dragTargetNode && dragTargetLocator
+      arguments: method === 'dragAndDrop' && dragTargetNode && dragTargetLocator
         ? [
             dragTargetNode.xpath
               ? `xpath=${dragTargetNode.xpath}`
               : this.getExecutor().selector(dragTargetLocator)
           ]
-        : plan.arguments
-    }];
-    let finalAction = action;
-    let finalLocator = locator;
-    let usage = response.usage;
-    if (plan.twoStep) {
-      const secondSnapshot = await this.snapshot();
-      const secondResponse = await this.completeObject<z.infer<typeof actionPlanSchema>>(config, {
-        purpose: 'act-second-step',
-        system: [
-          'Complete the second and final step of a two-step browser action.',
-          'Use exactly one elementId from the fresh snapshot.',
-          'Do not return another two-step plan.'
-        ].join(' '),
-        user: {
-          instruction: input.instruction,
-          target: input.target,
-          valueAvailable: input.value !== undefined,
-          snapshot: snapshotDiff(snapshot, secondSnapshot)
-        },
-        schema: actionPlanSchema,
-        timeoutMs,
+        : input.value !== undefined
+          ? [input.value, ...plan.arguments.slice(1)]
+          : plan.arguments
+    };
+    const firstResult = await this.takeDeterministicAction(
+      firstAction,
+      {
+        variables: input.variables,
+        timeoutMs: deadline.remaining(),
+        model: input.model,
+        cache: input.cache,
         abortSignal: input.abortSignal,
-        providerOptions: input.providerOptions,
-        model: input.model
-      });
-      usage = mergeUsage(usage, secondResponse.usage);
-      const secondPlan = secondResponse.value;
-      if (!secondPlan.elementId) {
-        return {
-          success: true,
-          message: 'First action completed; no second action was found',
-          actionDescription: description,
-          actions,
-          action,
-          locator,
-          fromCache: false,
-          selfHealed: false,
-          cacheStatus: 'MISS',
-          usage
-        };
-      }
-      const secondNode = secondSnapshot.nodes.find((item) => item.elementId === secondPlan.elementId);
-      const secondLocator = secondNode?.locators[0];
-      if (!secondNode || !secondLocator) {
-        throw runtimeError('AI_ACT_FAILED', `second step selected unknown element ${secondPlan.elementId}`);
-      }
-      await this.getExecutor().execute({
-        method: secondPlan.method,
-        locator: secondLocator,
-        value: substituteVariables(
-          input.value ?? secondPlan.arguments?.[0] ?? '',
+        providerOptions: input.providerOptions
+      },
+      deadline,
+      input.filePath
+    );
+    const firstWithUsage = { ...firstResult, usage: response.usage };
+    if (response.value.twoStep !== true) {
+      return firstWithUsage;
+    }
+
+    let usage = response.usage;
+    deadline.ensure();
+    const secondSnapshot = await this.snapshot();
+    let diff = snapshotDiff(snapshot, secondSnapshot);
+    if (!diff.trim()) {
+      diff = secondSnapshot.text;
+    }
+    deadline.ensure();
+    const secondResponse = await this.completeObject<z.infer<typeof actionPlanSchema>>(config, {
+      purpose: 'act-second-step',
+      system: buildActSystemPrompt(),
+      user: buildActUserPrompt(
+        buildActStepTwoPrompt(
+          input.instruction,
+          firstAction,
           input.variables
         ),
-        timeoutMs
-      });
-      finalAction = secondPlan.method;
-      finalLocator = secondLocator;
-      actions.push({
-        selector: this.getExecutor().selector(secondLocator),
-        description: secondPlan.reasoning || `Complete ${input.instruction}`,
-        method: secondPlan.method,
-        locator: secondLocator,
-        arguments: secondPlan.arguments
-      });
+        diff
+      ),
+      schema: actionPlanSchema,
+      timeoutMs: deadline.remaining(),
+      abortSignal: input.abortSignal,
+      providerOptions: input.providerOptions,
+      model: input.model
+    });
+    usage = mergeUsage(usage, secondResponse.usage);
+    const secondPlan = normalizeActionPlan(secondResponse.value);
+    if (!secondPlan?.elementId) {
+      return { ...firstWithUsage, usage };
     }
+    const secondNode = actionableSnapshotNode(secondSnapshot, secondPlan.elementId);
+    const secondLocator = secondNode?.locators[0];
+    if (!secondNode || !secondLocator) {
+      throw runtimeError('AI_ACT_FAILED', `second step selected unknown element ${secondPlan.elementId}`);
+    }
+    const secondTarget = secondPlan.method === 'dragAndDrop'
+      ? actionableSnapshotNode(secondSnapshot, secondPlan.arguments[0])
+      : undefined;
+    const secondAction: AiAction = {
+      selector: secondNode.xpath
+        ? `xpath=${secondNode.xpath}`
+        : this.getExecutor().selector(secondLocator),
+      description: secondPlan.description || `Complete ${input.instruction}`,
+      method: secondPlan.method,
+      locator: secondLocator,
+      arguments: secondTarget
+        ? [
+            secondTarget.xpath
+              ? `xpath=${secondTarget.xpath}`
+              : this.getExecutor().selector(secondTarget.locators[0]!)
+          ]
+        : secondPlan.arguments
+    };
+    const secondResult = await this.takeDeterministicAction(
+      secondAction,
+      {
+        variables: input.variables,
+        timeoutMs: deadline.remaining(),
+        model: input.model,
+        cache: input.cache,
+        abortSignal: input.abortSignal,
+        providerOptions: input.providerOptions
+      },
+      deadline,
+      input.filePath
+    );
     return {
-      success: true,
-      message: 'Action completed',
-      actionDescription: description,
-      actions,
-      action: finalAction,
-      locator: finalLocator,
+      success: firstResult.success && secondResult.success,
+      message: `${firstResult.message} → ${secondResult.message}`,
+      actionDescription: firstResult.actionDescription,
+      actions: [...firstResult.actions, ...secondResult.actions],
+      action: secondResult.action ?? firstResult.action,
+      locator: secondResult.locator ?? firstResult.locator,
       fromCache: false,
-      selfHealed: false,
+      selfHealed: firstResult.selfHealed || secondResult.selfHealed,
       cacheStatus: 'MISS',
       usage
     };
   }
 
-  private async replayAction(action: AiAction, options: AiActOptions): Promise<AiActResult> {
-    const config = await this.config();
-    const method = action.method ?? 'click';
-    const locator = action.locator ?? this.getExecutor().descriptorFromSelector(action.selector);
-    const timeoutMs = options.timeoutMs ?? config.runtimeAi.timeoutMs;
-    await this.getExecutor().execute({
-      method,
-      locator,
-      value: substituteVariables(action.arguments?.[0] ?? '', options.variables),
-      targetLocator: method === 'dragAndDrop' && action.arguments?.[0]
-        ? this.getExecutor().descriptorFromSelector(
-            substituteVariables(action.arguments[0], options.variables)
-          )
-        : undefined,
-      timeoutMs
-    });
-    return {
-      success: true,
-      message: 'Deterministic action replay completed',
-      actionDescription: action.description,
-      actions: [action],
-      action: method,
-      locator,
-      fromCache: false,
-      selfHealed: false,
-      cacheStatus: 'MISS'
-    };
-  }
-
-  private async replayActionWithHealing(
+  private async takeDeterministicAction(
     action: AiAction,
-    options: AiActOptions
+    options: AiActOptions,
+    deadline: ActDeadline,
+    filePath?: string
   ): Promise<AiActResult> {
+    const config = await this.config();
+    const method = action.method?.trim();
+    if (!method || method === 'not-supported') {
+      return {
+        success: false,
+        message: `Unable to perform action: The method '${method ?? ''}' is not supported in Action. Please use a supported Playwright locator method.`,
+        actionDescription: action.description || `Action (${method || 'unknown'})`,
+        actions: [],
+        fromCache: false,
+        selfHealed: false,
+        cacheStatus: 'MISS'
+      };
+    }
+    const placeholderArguments = [...(action.arguments ?? [])];
+    const resolvedArguments = placeholderArguments.map((argument) =>
+      substituteVariables(argument, options.variables)
+    );
+    const execute = async (
+      targetAction: AiAction
+    ): Promise<{ locator: LocatorDescriptor; recorded: AiAction }> => {
+      deadline.ensure();
+      const locator = await this.resolveActionLocator(targetAction);
+      deadline.ensure();
+      await this.getExecutor().execute({
+        method,
+        locator,
+        value: resolvedArguments[0] ?? '',
+        arguments: resolvedArguments,
+        filePath,
+        targetLocator: method === 'dragAndDrop' && resolvedArguments[0]
+          ? await this.resolveActionLocator({ selector: resolvedArguments[0] })
+          : undefined,
+        timeoutMs: deadline.remaining()
+      });
+      return {
+        locator,
+        recorded: {
+          selector: targetAction.selector,
+          description: action.description || `action (${method})`,
+          method,
+          arguments: placeholderArguments,
+          locator
+        }
+      };
+    };
+
     try {
-      return await this.replayAction(action, options);
-    } catch (firstError) {
-      const config = await this.config();
+      const performed = await execute(action);
+      return successfulDeterministicResult(
+        method as AiActionMethod,
+        performed.locator,
+        performed.recorded,
+        false
+      );
+    } catch (error) {
+      rethrowActTimeout(error);
       if (!config.runtimeAi.selfHeal) {
-        throw this.wrapActError(firstError);
+        return failedDeterministicResult(
+          method,
+          action.description,
+          `Failed to perform act: ${errorMessage(error)}`
+        );
       }
+
+      const command = action.description
+        ? action.description.toLowerCase().startsWith(method.toLowerCase())
+          ? action.description
+          : `${method} ${action.description}`
+        : method;
       try {
+        deadline.ensure();
         const snapshot = await this.snapshot();
-        const result = await this.planAndExecute({
-          instruction: action.description,
-          action: action.method,
-          value: action.arguments?.[0],
-          variables: options.variables,
-          timeoutMs: options.timeoutMs,
-          model: options.model,
-          cache: options.cache,
+        deadline.ensure();
+        const response = await this.completeObject<z.infer<typeof actionPlanSchema>>(config, {
+          purpose: 'act',
+          system: buildActSystemPrompt(),
+          user: buildActUserPrompt(
+            buildActPrompt({ instruction: command }, undefined),
+            snapshot.text
+          ),
+          schema: actionPlanSchema,
+          timeoutMs: deadline.remaining(),
           abortSignal: options.abortSignal,
-          providerOptions: options.providerOptions
-        }, snapshot, options.timeoutMs ?? config.runtimeAi.timeoutMs);
-        return { ...result, selfHealed: true };
-      } catch (secondError) {
-        throw this.wrapActError(secondError, firstError);
+          providerOptions: options.providerOptions,
+          model: options.model
+        });
+        const fallback = normalizeActionPlan(response.value);
+        const node = fallback?.elementId
+          ? actionableSnapshotNode(snapshot, fallback.elementId)
+          : undefined;
+        if (!node?.xpath || !node.locators[0]) {
+          return failedDeterministicResult(
+            method,
+            command,
+            'Failed to self-heal act: No observe results found for action',
+            response.usage
+          );
+        }
+        const performed = await execute({
+          ...action,
+          selector: `xpath=${node.xpath}`,
+          locator: node.locators[0]
+        });
+        return {
+          ...successfulDeterministicResult(
+            method as AiActionMethod,
+            performed.locator,
+            performed.recorded,
+            true
+          ),
+          usage: response.usage
+        };
+      } catch (retryError) {
+        rethrowActTimeout(retryError);
+        return failedDeterministicResult(
+          method,
+          action.description,
+          `Failed to perform act after self-heal: ${errorMessage(retryError)}`
+        );
       }
     }
+  }
+
+  private async resolveActionLocator(action: Pick<AiAction, 'selector' | 'locator'>): Promise<LocatorDescriptor> {
+    const supplied = action.locator;
+    if (supplied?.backendNodeId !== undefined) {
+      return supplied;
+    }
+
+    const normalizedSelector = action.selector.replace(/^xpath=/iu, '').trim();
+    if (normalizedSelector.startsWith('/')) {
+      const snapshot = this.latestSnapshot?.url === this.page.url()
+        ? this.latestSnapshot
+        : await this.captureSnapshot();
+      const selected = snapshot.nodes.find((candidate) => candidate.xpath === normalizedSelector);
+      const node = actionableSnapshotNode(snapshot, selected?.elementId);
+      const locator = node?.locators[0];
+      if (locator) {
+        return locator;
+      }
+    }
+    return supplied ?? this.getExecutor().descriptorFromSelector(action.selector);
   }
 
   private async executeAgentTool(
@@ -1662,13 +1757,16 @@ export class AiRuntime {
     if (model.generateObject) {
       return model.generateObject(input) as Promise<ModelObjectResult<T>>;
     }
+    const startedAt = Date.now();
+    const value = await model.completeJson(input) as T;
     return {
-      value: await model.completeJson(input) as T,
+      value,
       structuredOutputMode: 'prompt',
       usage: {},
       finishReason: 'stop',
       warnings: [],
-      durationMs: 0
+      durationMs: Date.now() - startedAt,
+      providerMetadata: { synthetic: true }
     };
   }
 
@@ -1690,9 +1788,20 @@ export class AiRuntime {
       typeof (this.page as unknown as { evaluate?: unknown }).evaluate === 'function'
     ) {
       await waitForPageReady(this.page, config, 0);
+      await waitForDomNetworkQuiet(this.page, config.pageReady.networkIdleTimeoutMs);
     }
+    return this.captureSnapshot(selector, ignoreSelectors);
+  }
+
+  private async captureSnapshot(
+    selector?: string,
+    ignoreSelectors: string[] = []
+  ): Promise<PageSnapshot> {
+    const config = await this.config();
     this.snapshotter ??= new PageSnapshotter(this.page, config.runtimeAi.snapshotMaxChars);
-    return this.snapshotter.capture(selector, ignoreSelectors);
+    const snapshot = await this.snapshotter.capture(selector, ignoreSelectors);
+    if (!selector && ignoreSelectors.length === 0) this.latestSnapshot = snapshot;
+    return snapshot;
   }
 
   private getExecutor(): ActionExecutor {
@@ -1711,15 +1820,6 @@ export class AiRuntime {
       config.runtimeAi.cacheDir
     ));
     return this.cache;
-  }
-
-  private wrapActError(error: unknown, previous?: unknown): AiRuntimeError {
-    if (error instanceof AiRuntimeError && error.code === 'AI_ACT_FAILED') {
-      return error;
-    }
-    return runtimeError('AI_ACT_FAILED', error instanceof Error ? error.message : String(error), {
-      previous: previous instanceof Error ? previous.message : previous
-    });
   }
 
   private async artifact(kind: string, value: unknown): Promise<string> {
@@ -1834,6 +1934,175 @@ function isAiAction(value: unknown): value is AiAction {
     'selector' in value &&
     typeof (value as { selector?: unknown }).selector === 'string'
   );
+}
+
+const supportedActionMethods = new Set<AiActionMethod>([
+  'click',
+  'tap',
+  'fill',
+  'type',
+  'selectOption',
+  'selectOptionFromDropdown',
+  'setInputFiles',
+  'press',
+  'hover',
+  'doubleClick',
+  'scrollIntoView',
+  'scrollByPixelOffset',
+  'scroll',
+  'scrollTo',
+  'mouse.wheel',
+  'nextChunk',
+  'prevChunk',
+  'dragAndDrop'
+]);
+
+function isSupportedActionMethod(value: string): value is AiActionMethod {
+  return supportedActionMethods.has(value as AiActionMethod);
+}
+
+type NormalizedActionPlan = {
+  elementId: string;
+  description: string;
+  method: AiActionMethod;
+  arguments: string[];
+  twoStep: boolean;
+};
+
+function normalizeActionPlan(value: unknown): NormalizedActionPlan | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const rawAction = record.action === null
+    ? undefined
+    : record.action && typeof record.action === 'object'
+      ? record.action as Record<string, unknown>
+      : record;
+  if (!rawAction) {
+    return undefined;
+  }
+  const elementId = rawAction.elementId;
+  const method = rawAction.method;
+  if (
+    typeof elementId !== 'string' ||
+    !/^\d+-\d+$/u.test(elementId) ||
+    typeof method !== 'string' ||
+    !isSupportedActionMethod(method)
+  ) {
+    return undefined;
+  }
+  return {
+    elementId,
+    description: typeof rawAction.description === 'string'
+      ? rawAction.description
+      : typeof rawAction.reasoning === 'string'
+        ? rawAction.reasoning
+        : '',
+    method,
+    arguments: Array.isArray(rawAction.arguments)
+      ? rawAction.arguments.filter((argument): argument is string =>
+          typeof argument === 'string'
+        )
+      : [],
+    twoStep: record.twoStep === true
+  };
+}
+
+const inferenceActionMethods: AiActionMethod[] = [
+  'click',
+  'fill',
+  'type',
+  'press',
+  'scrollTo',
+  'nextChunk',
+  'prevChunk',
+  'selectOptionFromDropdown',
+  'hover',
+  'doubleClick',
+  'dragAndDrop'
+];
+
+function buildActSystemPrompt(): string {
+  return [
+    'You are the element resolver for Vole: given a natural-language action and a hybrid DOM and accessibility snapshot of the page, decide which single element the action should target.',
+    'Your inputs are an instruction that describes the desired action, and an indented outline of the semantic structure of the page.',
+    'When an element matches the instruction, return that element. When nothing on the page fits, return action set to null.',
+    'Never invent an element. elementId, description, and method must always refer to something present in the snapshot; blanks and placeholders are not allowed.',
+    'Element identifiers have the shape frameOrdinal-backendNodeId. Reproduce the identifier character for character from the snapshot.'
+  ].join(' ');
+}
+
+function buildActPrompt(
+  input: AiActInput,
+  variables?: AiVariables
+): string {
+  const supported = input.action
+    ? [input.action]
+    : inferenceActionMethods;
+  const variableNames = variablePromptEntries(variables)
+    .map(({ name }) => `%${name}%`);
+  const variablePrompt = variableNames.length > 0
+    ? [
+        `The caller supplied these variable names: ${variableNames.join(', ')}.`,
+        'They are placeholders, not literal values.',
+        'When an argument should use one, put the wrapped name (%name%) in the arguments array instead of the real value.'
+      ].join(' ')
+    : '';
+  const suppliedValue = input.value !== undefined
+    ? 'The caller attached a value to this action. Use that value for the chosen method and do not invent or echo it in the response.'
+    : '';
+  const suppliedFile = input.filePath !== undefined
+    ? 'The caller attached a file path. Choose setInputFiles and do not invent or return the path itself.'
+    : '';
+  return `
+Resolve one element and action for this instruction: ${input.instruction}.
+${input.target ? `The caller named this target: ${input.target}.` : ''}
+Apply the dropdown rules only when the instruction is explicitly about choosing an option from a dropdown.
+
+Action contract:
+- Emit one action whose method is one of: ${supported.join(', ')}.
+- For a right or middle click, put right or middle as the first argument.
+- When the instruction does not map to any action on this page, or nothing matches, set action to null. Do not invent an element.
+- Express a scroll target as a percentage in the arguments, for example 50% or 75%.
+- To move one viewport forward or back, choose nextChunk or prevChunk and pass no arguments.
+- For a keystroke, choose press and give the precise key as the argument, for example Enter, Tab, Escape, Space, or a.
+
+Dropdown rules:
+- For a native select element, choose selectOptionFromDropdown, pass its exact option text, and set twoStep to false.
+- For a custom dropdown that opens on click, choose the element that opens it and set twoStep to true.
+
+${variablePrompt}
+${suppliedValue}
+${suppliedFile}
+`.trim();
+}
+
+function buildActStepTwoPrompt(
+  originalInstruction: string,
+  previousAction: AiAction,
+  variables?: AiVariables
+): string {
+  const variableNames = variablePromptEntries(variables)
+    .map(({ name }) => `%${name}%`);
+  return `
+The original instruction was: ${originalInstruction}.
+Step 1 of 2 is complete: method ${previousAction.method}; ${previousAction.description}; arguments ${(previousAction.arguments ?? []).join(', ')}.
+
+Now resolve the single element and action that finish step 2 of 2.
+Pick a method from: ${inferenceActionMethods
+    .filter((method) => method !== 'selectOptionFromDropdown')
+    .join(', ')}.
+Do not propose another two-step plan.
+If nothing matches, set action to null instead of guessing.
+${variableNames.length > 0
+    ? `Variable names available: ${variableNames.join(', ')}. Return the wrapped placeholders, not their values.`
+    : ''}
+`.trim();
+}
+
+function buildActUserPrompt(instruction: string, snapshot: string): string {
+  return `instruction: ${instruction}\n\npage outline:\n${snapshot}\n`;
 }
 
 type UrlPathSegment = string | '*';
@@ -2165,7 +2434,7 @@ function transformActionVariables(
 
 function safeValue(value: unknown, key = ''): unknown {
   if (
-    /(password|secret|api.?key|api.?token|access.?token|refresh.?token|authorization|base64)/iu
+    /(password|secret|api.?key|api.?token|access.?token|refresh.?token|authorization)/iu
       .test(key) ||
     /^token$/iu.test(key)
   ) {
@@ -2186,6 +2455,8 @@ function safeValue(value: unknown, key = ''): unknown {
   }
   return value;
 }
+
+export const runtimeTestExports = { safeValue };
 
 function redactEmbeddedVariables(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -2251,25 +2522,36 @@ function transformVariables(
 }
 
 function snapshotDiff(before: PageSnapshot, after: PageSnapshot): string {
-  const previous = new Map(
-    before.nodes.map((node) => [
-      node.elementId,
-      JSON.stringify([node.tag, node.role, node.name, node.value, node.disabled])
-    ])
+  const previousLines = new Set(
+    before.text.split('\n').map((line) => line.trim()).filter(Boolean)
   );
-  const changedIds = new Set(
-    after.nodes
-      .filter((node) => previous.get(node.elementId) !==
-        JSON.stringify([node.tag, node.role, node.name, node.value, node.disabled]))
-      .map((node) => node.elementId)
-  );
-  const changedLines = after.text
-    .split('\n')
-    .filter((line) => {
-      const match = line.match(/^\[([^\]]+)\]/u);
-      return !match || (match[1] ? changedIds.has(match[1]) : false);
-    });
-  return changedIds.size > 0 ? changedLines.join('\n') : after.text;
+  const added = after.text.split('\n').filter((line) => {
+    const core = line.trim();
+    return Boolean(core) && !previousLines.has(core);
+  });
+  if (added.length === 0) return '';
+  const minIndent = Math.min(...added.map((line) => line.match(/^\s*/u)?.[0].length ?? 0));
+  return added.map((line) => line.slice(minIndent)).join('\n');
+}
+
+function actionableSnapshotNode(
+  snapshot: PageSnapshot,
+  elementId: string | undefined
+): SnapshotNode | undefined {
+  if (!elementId) return undefined;
+  const node = snapshot.nodes.find((candidate) => candidate.elementId === elementId);
+  if (!node?.xpath) return node;
+  const actionableXpath = node.xpath.replace(/\/text\(\)(?:\[\d+\])?$/iu, '');
+  if (actionableXpath === node.xpath) return node;
+  const parent = snapshot.nodes.find((candidate) => candidate.xpath === actionableXpath);
+  if (parent) return parent;
+  return {
+    ...node,
+    xpath: actionableXpath,
+    locators: node.locators.map((locator) =>
+      locator.strategy === 'xpath' ? { ...locator, value: actionableXpath } : locator
+    )
+  };
 }
 
 function mergeUsage(
@@ -2289,4 +2571,88 @@ function mergeUsage(
     cachedInputTokens: add(left.cachedInputTokens, right.cachedInputTokens),
     cacheWriteTokens: add(left.cacheWriteTokens, right.cacheWriteTokens)
   };
+}
+
+type ActDeadline = {
+  ensure(): void;
+  remaining(): number;
+};
+
+function createActDeadline(timeoutMs: number): ActDeadline {
+  const startedAt = Date.now();
+  const enabled = timeoutMs > 0;
+  const ensure = (): void => {
+    if (enabled && Date.now() - startedAt >= timeoutMs) {
+      throw runtimeError('AI_RUNTIME_TIMEOUT', `act timed out after ${timeoutMs}ms`);
+    }
+  };
+  return {
+    ensure,
+    remaining: () => {
+      ensure();
+      return enabled ? Math.max(1, timeoutMs - (Date.now() - startedAt)) : 2_147_483_647;
+    }
+  };
+}
+
+function successfulDeterministicResult(
+  method: AiActionMethod,
+  locator: LocatorDescriptor,
+  action: AiAction,
+  selfHealed: boolean
+): AiActResult {
+  return {
+    success: true,
+    message: `Action [${method}] performed successfully on selector: ${action.selector}`,
+    actionDescription: action.description || `action (${method})`,
+    actions: [action],
+    action: method,
+    locator,
+    fromCache: false,
+    selfHealed,
+    cacheStatus: 'MISS'
+  };
+}
+
+function failedDeterministicResult(
+  method: string,
+  description: string | undefined,
+  message: string,
+  usage?: ModelObjectResult<unknown>['usage']
+): AiActResult {
+  return {
+    success: false,
+    message,
+    actionDescription: description || `action (${method})`,
+    actions: [],
+    action: isSupportedActionMethod(method) ? method : undefined,
+    fromCache: false,
+    selfHealed: false,
+    cacheStatus: 'MISS',
+    usage
+  };
+}
+
+function rethrowActTimeout(error: unknown): void {
+  if (error instanceof AiRuntimeError && error.code === 'AI_RUNTIME_TIMEOUT') {
+    throw error;
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function actionsChanged(original: AiAction[], current: AiAction[]): boolean {
+  if (original.length !== current.length) {
+    return true;
+  }
+  return original.some((action, index) => {
+    const next = current[index];
+    return !next ||
+      action.selector !== next.selector ||
+      action.description !== next.description ||
+      (action.method ?? '') !== (next.method ?? '') ||
+      JSON.stringify(action.arguments ?? []) !== JSON.stringify(next.arguments ?? []);
+  });
 }

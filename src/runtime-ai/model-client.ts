@@ -310,14 +310,21 @@ export class RuntimeModelClient {
       : baseModel;
     const userContent = input.image
       ? [
-          { type: 'text' as const, text: JSON.stringify(input.user) },
+          {
+            type: 'text' as const,
+            text: typeof input.user === 'string'
+              ? input.user
+              : JSON.stringify(input.user)
+          },
           {
             type: 'image' as const,
             image: input.image.data,
             mediaType: input.image.mediaType
           }
         ]
-      : JSON.stringify(input.user);
+      : typeof input.user === 'string'
+        ? input.user
+        : JSON.stringify(input.user);
     const wrapOutput =
       (input.schema._def as { typeName?: z.ZodFirstPartyTypeKind }).typeName !==
       z.ZodFirstPartyTypeKind.ZodObject;
@@ -342,6 +349,13 @@ export class RuntimeModelClient {
         description: `Structured result for ${input.purpose}`
       }),
       temperature: this.config.ai.temperature,
+      ...(input.purpose === 'act' || input.purpose === 'act-second-step'
+        ? {
+            topP: 1,
+            frequencyPenalty: 0,
+            presencePenalty: 0
+          }
+        : {}),
       maxRetries: this.config.ai.maxRetries,
       timeout: input.timeoutMs ?? this.config.ai.timeoutMs,
       abortSignal: input.abortSignal,
@@ -482,9 +496,6 @@ function resolveApiKey(config: VoleConfig): string {
   const value = variable ? process.env[variable] : undefined;
   if (value) {
     return value;
-  }
-  if (variable && !/^[A-Z_][A-Z0-9_]*$/u.test(variable)) {
-    return variable;
   }
   throw runtimeError(
     'AI_MODEL_REQUEST_FAILED',

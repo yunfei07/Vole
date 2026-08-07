@@ -11,7 +11,7 @@ import type {
 } from './types.js';
 import { redactVariables } from './variables.js';
 
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 export type CachedAction = {
   version: number;
@@ -52,14 +52,13 @@ export class AiRuntimeCache {
     model: string;
     variables?: AiVariables;
   }): string {
-    const instruction = redactVariables(input.instruction, input.variables);
     return createHash('sha256')
       .update(JSON.stringify({
         version: CACHE_VERSION,
-        instruction: normalizeInstruction(instruction),
+        instruction: normalizeInstruction(redactVariables(input.instruction, input.variables)),
         url: normalizeUrl(input.url),
-        pageFingerprint: input.pageFingerprint,
         model: input.model,
+        pageFingerprint: input.pageFingerprint,
         variableNames: Object.keys(input.variables ?? {}).sort()
       }))
       .digest('hex');
@@ -89,15 +88,23 @@ export class AiRuntimeCache {
     if (!(await pathExists(filePath))) {
       return undefined;
     }
+    let raw: string;
     try {
-      const value = JSON.parse(await readFile(filePath, 'utf8')) as CachedAction;
-      if (value.version !== CACHE_VERSION || value.key !== key) {
-        return undefined;
-      }
-      return value;
+      raw = await readFile(filePath, 'utf8');
     } catch {
       return undefined;
     }
+    let value: CachedAction;
+    try {
+      value = JSON.parse(raw) as CachedAction;
+    } catch (error) {
+      await this.evictCorrupt(filePath, error);
+      return undefined;
+    }
+    if (value.version !== CACHE_VERSION || value.key !== key) {
+      return undefined;
+    }
+    return value;
   }
 
   async set(input: Omit<CachedAction, 'version' | 'createdAt' | 'updatedAt'>): Promise<void> {
@@ -121,16 +128,24 @@ export class AiRuntimeCache {
     if (!(await pathExists(filePath))) {
       return undefined;
     }
+    let raw: string;
     try {
-      const value = JSON.parse(await readFile(filePath, 'utf8')) as CachedAgentTrajectory;
-      return value.version === CACHE_VERSION &&
-        value.key === key &&
-        Array.isArray(value.history)
-        ? value
-        : undefined;
+      raw = await readFile(filePath, 'utf8');
     } catch {
       return undefined;
     }
+    let value: CachedAgentTrajectory;
+    try {
+      value = JSON.parse(raw) as CachedAgentTrajectory;
+    } catch (error) {
+      await this.evictCorrupt(filePath, error);
+      return undefined;
+    }
+    return value.version === CACHE_VERSION &&
+      value.key === key &&
+      Array.isArray(value.history)
+      ? value
+      : undefined;
   }
 
   async setAgentTrajectory(
@@ -153,6 +168,12 @@ export class AiRuntimeCache {
 
   async deleteAgentTrajectory(key: string): Promise<void> {
     await unlink(this.trajectoryFilePath(key)).catch(() => undefined);
+  }
+
+  private async evictCorrupt(filePath: string, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[vole] discarding unreadable cache file ${filePath}: ${message}`);
+    await unlink(filePath).catch(() => undefined);
   }
 
   private filePath(key: string): string {
