@@ -7,6 +7,7 @@ import {
   hasToolCall,
   stepCountIs,
   tool as aiTool,
+  type ModelMessage,
   type StepResult,
   type ToolSet
 } from 'ai';
@@ -543,6 +544,119 @@ export class AiRuntime {
     return this.runSdkAgent(input, agentConfig, config, model as RuntimeModelClient);
   }
 
+  private buildAgentLoop(
+    input: AiAgentInput,
+    config: VoleConfig,
+    history: AiAgentHistoryItem[],
+    modelName: string,
+    agentConfig: AiAgentConfig,
+    maxSteps: number,
+    model: RuntimeModelClient
+  ) {
+    const tools = this.createSdkAgentTools(
+      input,
+      config,
+      history,
+      agentConfig.tools,
+      agentConfig.executionModel,
+      agentConfig.excludeTools
+    );
+    return new ToolLoopAgent({
+      model: model.getLanguageModel(modelName),
+      instructions: agentConfig.systemPrompt ?? agentSystemPrompt(),
+      tools,
+      stopWhen: [hasToolCall('done'), stepCountIs(maxSteps)],
+      prepareStep: input.callbacks?.prepareStep,
+      onStepFinish: (event) => this.handleAgentStep(input, event),
+      providerOptions: input.providerOptions
+    });
+  }
+
+  private async finalizeAgentDone(
+    input: AiAgentInput,
+    config: VoleConfig,
+    history: AiAgentHistoryItem[],
+    modelName: string,
+    agentConfig: AiAgentConfig,
+    model: RuntimeModelClient,
+    instructions: string,
+    timeoutMs: number
+  ): Promise<ReturnType<typeof lastDone>> {
+    const existing = lastDone(history);
+    if (existing) {
+      return existing;
+    }
+    const forcedTools = this.createSdkAgentTools(
+      input,
+      config,
+      history,
+      undefined,
+      agentConfig.executionModel,
+      agentConfig.excludeTools
+    );
+    const finalizer = new ToolLoopAgent({
+      model: model.getLanguageModel(modelName),
+      instructions,
+      tools: { done: forcedTools.done },
+      toolChoice: { type: 'tool', toolName: 'done' },
+      stopWhen: hasToolCall('done'),
+      providerOptions: input.providerOptions
+    });
+    await finalizer.generate({
+      prompt: JSON.stringify({ goal: input.instruction, history: safeValue(history) }),
+      abortSignal: input.abortSignal,
+      timeout: timeoutMs
+    });
+    return lastDone(history);
+  }
+
+  private buildAgentResult(
+    input: AiAgentInput,
+    done: NonNullable<ReturnType<typeof lastDone>>,
+    history: AiAgentHistoryItem[],
+    responseMessages: readonly ModelMessage[],
+    usage: Parameters<typeof toRuntimeUsage>[0],
+    startedAt: number
+  ): AiAgentResult {
+    return {
+      success: true,
+      message: done.message,
+      steps: history.length,
+      history,
+      actions: history,
+      completed: true,
+      usage: {
+        ...toRuntimeUsage(usage),
+        inferenceTimeMs: Date.now() - startedAt
+      },
+      messages: [
+        ...(input.messages ?? []),
+        ...(input.messages?.length
+          ? [{ role: 'user' as const, content: input.instruction }]
+          : []),
+        ...responseMessages
+      ],
+      output: done.output,
+      cacheStatus: 'MISS',
+      selfHealed: false
+    };
+  }
+
+  private async handleAgentTerminalError(
+    input: AiAgentInput,
+    error: unknown,
+    history: AiAgentHistoryItem[]
+  ): Promise<Error> {
+    const mapped = error instanceof Error ? error : new Error(String(error));
+    const terminalError = normalizeAgentError(mapped, history);
+    if (input.abortSignal?.aborted) {
+      await input.callbacks?.onAbort?.();
+    } else {
+      await input.callbacks?.onError?.(terminalError);
+    }
+    return terminalError;
+  }
+
   private async runSdkAgent(
     input: AiAgentInput,
     agentConfig: AiAgentConfig,
@@ -622,23 +736,7 @@ export class AiRuntime {
       }
     }
 
-    const tools = this.createSdkAgentTools(
-      input,
-      config,
-      history,
-      agentConfig.tools,
-      agentConfig.executionModel,
-      agentConfig.excludeTools
-    );
-    const loop = new ToolLoopAgent({
-      model: model.getLanguageModel(modelName),
-      instructions: agentConfig.systemPrompt ?? agentSystemPrompt(),
-      tools,
-      stopWhen: [hasToolCall('done'), stepCountIs(maxSteps)],
-      prepareStep: input.callbacks?.prepareStep,
-      onStepFinish: (event) => this.handleAgentStep(input, event),
-      providerOptions: input.providerOptions
-    });
+    const loop = this.buildAgentLoop(input, config, history, modelName, agentConfig, maxSteps, model);
 
     try {
       const generated = await loop.generate({
@@ -646,37 +744,19 @@ export class AiRuntime {
         abortSignal: input.abortSignal,
         timeout: input.timeoutMs ?? config.runtimeAi.agent.timeoutMs
       });
-      let done = lastDone(history);
-      if (!done) {
-        const forcedTools = this.createSdkAgentTools(
-          input,
-          config,
-          history,
-          undefined,
-          agentConfig.executionModel,
-          agentConfig.excludeTools
-        );
-        const finalizer = new ToolLoopAgent({
-          model: model.getLanguageModel(modelName),
-          instructions: 'Call done once. Report success only when the supplied history proves the goal.',
-          tools: { done: forcedTools.done },
-          toolChoice: { type: 'tool', toolName: 'done' },
-          stopWhen: hasToolCall('done'),
-          providerOptions: input.providerOptions
-        });
-        await finalizer.generate({
-          prompt: JSON.stringify({
-            goal: input.instruction,
-            history: safeValue(history)
-          }),
-          abortSignal: input.abortSignal,
-          timeout: Math.min(
-            input.timeoutMs ?? config.runtimeAi.agent.timeoutMs,
-            config.runtimeAi.agent.toolTimeoutMs
-          )
-        });
-        done = lastDone(history);
-      }
+      const done = await this.finalizeAgentDone(
+        input,
+        config,
+        history,
+        modelName,
+        agentConfig,
+        model,
+        'Call done once. Report success only when the supplied history proves the goal.',
+        Math.min(
+          input.timeoutMs ?? config.runtimeAi.agent.timeoutMs,
+          config.runtimeAi.agent.toolTimeoutMs
+        )
+      );
       if (!done?.success) {
         throw runtimeError(
           'AI_AGENT_FAILED',
@@ -685,29 +765,14 @@ export class AiRuntime {
         );
       }
 
-      const output = done.output;
-      const result: AiAgentResult = {
-        success: true,
-        message: done.message,
-        steps: history.length,
+      const result = this.buildAgentResult(
+        input,
+        done,
         history,
-        actions: history,
-        completed: true,
-        usage: {
-          ...toRuntimeUsage(generated.usage),
-          inferenceTimeMs: Date.now() - startedAt
-        },
-        messages: [
-          ...(input.messages ?? []),
-          ...(input.messages?.length
-            ? [{ role: 'user' as const, content: input.instruction }]
-            : []),
-          ...generated.responseMessages
-        ],
-        output,
-        cacheStatus: 'MISS',
-        selfHealed: false
-      };
+        generated.responseMessages,
+        generated.usage,
+        startedAt
+      );
       if (cacheEligible) {
         await cache.setAgentTrajectory({
           key: cacheKey,
@@ -725,13 +790,7 @@ export class AiRuntime {
       await this.tryArtifact('agent', { input, result });
       return result;
     } catch (error) {
-      const mapped = error instanceof Error ? error : new Error(String(error));
-      const terminalError = normalizeAgentError(mapped, history);
-      if (input.abortSignal?.aborted) {
-        await input.callbacks?.onAbort?.();
-      } else {
-        await input.callbacks?.onError?.(terminalError);
-      }
+      const terminalError = await this.handleAgentTerminalError(input, error, history);
       const artifactPath = await this.tryArtifact('agent-failed', {
         input,
         history,
@@ -764,30 +823,12 @@ export class AiRuntime {
         'streaming DOM Agent requires an AI SDK v7 language model with tool calling'
       );
     }
+    const runtimeModel = model as RuntimeModelClient;
     const history: AiAgentHistoryItem[] = [];
     const modelName = agentConfig.model ?? config.runtimeAi.model ?? config.ai.model;
     const maxSteps = input.maxSteps ?? config.runtimeAi.agent.maxSteps;
     const startedAt = Date.now();
-    const tools = this.createSdkAgentTools(
-      input,
-      config,
-      history,
-      agentConfig.tools,
-      agentConfig.executionModel,
-      agentConfig.excludeTools
-    );
-    const loop = new ToolLoopAgent({
-      model: model.getLanguageModel(modelName),
-      instructions: agentConfig.systemPrompt ?? agentSystemPrompt(),
-      tools,
-      stopWhen: [
-        hasToolCall('done'),
-        stepCountIs(maxSteps)
-      ],
-      prepareStep: input.callbacks?.prepareStep,
-      onStepFinish: (event) => this.handleAgentStep(input, event),
-      providerOptions: input.providerOptions
-    });
+    const loop = this.buildAgentLoop(input, config, history, modelName, agentConfig, maxSteps, runtimeModel);
     let streamed: Awaited<ReturnType<typeof loop.stream>>;
     try {
       streamed = await loop.stream({
@@ -796,13 +837,7 @@ export class AiRuntime {
         timeout: input.timeoutMs ?? config.runtimeAi.agent.timeoutMs
       });
     } catch (error) {
-      const mapped = error instanceof Error ? error : new Error(String(error));
-      const terminalError = normalizeAgentError(mapped, history);
-      if (input.abortSignal?.aborted) {
-        await input.callbacks?.onAbort?.();
-      } else {
-        await input.callbacks?.onError?.(terminalError);
-      }
+      const terminalError = await this.handleAgentTerminalError(input, error, history);
       throw terminalError;
     }
     const result = (async (): Promise<AiAgentResult> => {
@@ -811,31 +846,16 @@ export class AiRuntime {
           streamed.usage,
           streamed.responseMessages
         ]);
-        let done = lastDone(history);
-        if (!done) {
-          const forcedTools = this.createSdkAgentTools(
-            input,
-            config,
-            history,
-            undefined,
-            agentConfig.executionModel,
-            agentConfig.excludeTools
-          );
-          const finalizer = new ToolLoopAgent({
-            model: model.getLanguageModel!(modelName),
-            instructions: 'Call done once based only on the verified streaming agent history.',
-            tools: { done: forcedTools.done },
-            toolChoice: { type: 'tool', toolName: 'done' },
-            stopWhen: hasToolCall('done'),
-            providerOptions: input.providerOptions
-          });
-          await finalizer.generate({
-            prompt: JSON.stringify({ goal: input.instruction, history: safeValue(history) }),
-            abortSignal: input.abortSignal,
-            timeout: config.runtimeAi.agent.toolTimeoutMs
-          });
-          done = lastDone(history);
-        }
+        const done = await this.finalizeAgentDone(
+          input,
+          config,
+          history,
+          modelName,
+          agentConfig,
+          runtimeModel,
+          'Call done once based only on the verified streaming agent history.',
+          config.runtimeAi.agent.toolTimeoutMs
+        );
         if (!done?.success) {
           throw runtimeError(
             'AI_AGENT_FAILED',
@@ -843,40 +863,12 @@ export class AiRuntime {
             { history }
           );
         }
-        const output = done.output;
-        const value: AiAgentResult = {
-          success: true,
-          message: done.message,
-          steps: history.length,
-          history,
-          actions: history,
-          completed: true,
-          usage: {
-            ...toRuntimeUsage(usage),
-            inferenceTimeMs: Date.now() - startedAt
-          },
-          messages: [
-            ...(input.messages ?? []),
-            ...(input.messages?.length
-              ? [{ role: 'user' as const, content: input.instruction }]
-              : []),
-            ...responseMessages
-          ],
-          output,
-          cacheStatus: 'MISS',
-          selfHealed: false
-        };
+        const value = this.buildAgentResult(input, done, history, responseMessages, usage, startedAt);
         await input.callbacks?.onEvidence?.({ type: 'final', data: value });
         await input.callbacks?.onFinish?.(value);
         return value;
       } catch (error) {
-        const mapped = error instanceof Error ? error : new Error(String(error));
-        const terminalError = normalizeAgentError(mapped, history);
-        if (input.abortSignal?.aborted) {
-          await input.callbacks?.onAbort?.();
-        } else {
-          await input.callbacks?.onError?.(terminalError);
-        }
+        const terminalError = await this.handleAgentTerminalError(input, error, history);
         throw terminalError;
       }
     })();
