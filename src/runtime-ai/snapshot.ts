@@ -135,19 +135,28 @@ export class PageSnapshotter {
   }
 
   private async getSession(): Promise<CDPSession> {
-    return this.getFrameSession(0);
+    const session = await this.getFrameSession(0);
+    if (!session) {
+      throw runtimeError('AI_SNAPSHOT_FAILED', 'failed to open a CDP session for the root frame');
+    }
+    return session;
   }
 
-  private async getFrameSession(frameOrdinal: number): Promise<CDPSession> {
+  private async getFrameSession(frameOrdinal: number): Promise<CDPSession | undefined> {
     const cached = this.sessions.get(frameOrdinal);
     if (cached) return cached;
     const target = this.page.frames()[frameOrdinal] ?? this.page;
-    const session = await this.page.context().newCDPSession(target).catch(async (error) => {
+    try {
+      const session = await this.page.context().newCDPSession(target);
+      this.sessions.set(frameOrdinal, session);
+      return session;
+    } catch (error) {
       if (frameOrdinal === 0) throw error;
-      return this.getSession();
-    });
-    this.sessions.set(frameOrdinal, session);
-    return session;
+      // Could not open a CDP session for this (likely out-of-process) frame.
+      // Return undefined so callers skip it instead of silently falling back
+      // to the root session and attributing the root's tree to this frame.
+      return undefined;
+    }
   }
 
   private async captureAxTrees(frameTree: CdpFrameTree): Promise<AxResponse[]> {
@@ -173,6 +182,9 @@ export class PageSnapshotter {
         }
       }
       const session = await this.getFrameSession(frameOrdinal);
+      if (!session) {
+        return { frameOrdinal, nodes: [] };
+      }
       const response = await session.send('Accessibility.getFullAXTree') as AxResponse;
       return { frameOrdinal, nodes: response.nodes ?? [] };
     }));
@@ -188,6 +200,7 @@ export class PageSnapshotter {
     })));
     const ordinalsBySession = new Map<CDPSession, number[]>();
     for (const { frameOrdinal, session } of sessionByOrdinal) {
+      if (!session) continue;
       const values = ordinalsBySession.get(session) ?? [];
       values.push(frameOrdinal);
       ordinalsBySession.set(session, values);
