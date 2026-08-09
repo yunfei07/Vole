@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { loggingConfigSchema } from '../logging/config.js';
 
 const pageReadySchema = z.object({
   waitForNetworkIdle: z.boolean().default(true),
@@ -36,6 +37,7 @@ const runtimeAiSchema = z.object({
   snapshotMaxChars: z.number().int().min(5000).default(60000),
   cacheDir: z.string().min(1).default('.vole/ai-cache'),
   artifactsDir: z.string().min(1).default('.vole/artifacts/ai'),
+  thinking: z.enum(['enabled', 'disabled']).default('disabled'),
   agent: z.object({
     maxSteps: z.number().int().min(1).max(50).default(8),
     timeoutMs: z.number().int().positive().default(120000),
@@ -52,6 +54,7 @@ export const voleConfigSchema = z.object({
   caseDir: z.string().min(1),
   knowledgeBase: z.string().min(1),
   artifactsDir: z.string().min(1),
+  logging: loggingConfigSchema.default({}),
   scanPages: z.array(
     z.object({
       name: z.string().min(1),

@@ -14,6 +14,8 @@ import {
 import { z } from 'zod';
 import { loadConfig } from '../config/load-config.js';
 import type { VoleConfig } from '../config/schema.js';
+import { runtimeLogger } from '../logging/context.js';
+import { hashSensitiveText, type VoleLogger } from '../logging/logger.js';
 import { waitForDomNetworkQuiet, waitForPageReady } from '../playwright/page-readiness.js';
 import { ensureDir } from '../utils/fs.js';
 import { ActionExecutor, SUPPORTED_ACTIONS } from './action-executor.js';
@@ -45,12 +47,14 @@ import type {
   AiAssertInput,
   AiAssertResult,
   AiExtractOptions,
+  AiExtractCompleteness,
   AiObserveOptions,
   AiVariables,
   ExtractSchema,
   LocatorDescriptor,
   PageSnapshot,
-  SnapshotNode
+  SnapshotNode,
+  ToolKind
 } from './types.js';
 
 /**
@@ -104,6 +108,12 @@ const assertExtractSchema = z.object({
   evidence: z.array(z.string()).default([])
 });
 
+const extractCompletenessSchema = z.object({
+  completed: z.boolean(),
+  missing: z.array(z.string()).default([]),
+  reason: z.string().default('')
+});
+
 const semanticJudgeSchema = z.object({
   passed: z.boolean(),
   reason: z.string(),
@@ -117,6 +127,7 @@ export type CreateAiRuntimeOptions = {
   cwd?: string;
   config?: VoleConfig;
   model?: RuntimeModel;
+  logger?: VoleLogger;
 };
 
 export class AiRuntime {
@@ -126,11 +137,14 @@ export class AiRuntime {
   private model?: RuntimeModel;
   private cache?: AiRuntimeCache;
   private latestSnapshot?: PageSnapshot;
+  private readonly logger: VoleLogger;
 
   constructor(
     private readonly page: Page,
     private readonly options: CreateAiRuntimeOptions = {}
-  ) {}
+  ) {
+    this.logger = runtimeLogger(options.logger).child({ component: 'runtime-ai' });
+  }
 
   async observe(): Promise<AiActionCandidate[]>;
   async observe(options: AiObserveOptions): Promise<AiActionCandidate[]>;
@@ -145,6 +159,11 @@ export class AiRuntime {
     const options = typeof instructionOrOptions === 'string'
       ? suppliedOptions
       : instructionOrOptions ?? {};
+    const startedAt = Date.now();
+    this.logger.info('ai.observe_started', {
+      instructionHash: hashSensitiveText(instruction),
+      instructionLength: instruction.length
+    });
     const config = await this.config();
     const snapshot = await this.snapshot(options.selector, options.ignoreSelectors);
     const response = await this.completeObject<z.infer<typeof observeResponseSchema>>(config, {
@@ -205,6 +224,10 @@ export class AiRuntime {
       value: response.usage,
       enumerable: false
     });
+    this.logger.info('ai.observe_completed', {
+      candidateCount: candidates.length,
+      durationMs: Date.now() - startedAt
+    });
     return candidates;
   }
 
@@ -234,9 +257,20 @@ export class AiRuntime {
       : isZodSchema(schemaOrOptions)
         ? suppliedOptions
         : (schemaOrOptions as AiExtractOptions | undefined) ?? {};
+    const startedAt = Date.now();
+    this.logger.info('ai.extract_started', {
+      instructionHash: instruction ? hashSensitiveText(instruction) : undefined,
+      instructionLength: instruction?.length ?? 0,
+      structured: Boolean(schema),
+      screenshot: options.screenshot === true
+    });
     const config = await this.config();
     const snapshot = await this.snapshot(options.selector, options.ignoreSelectors);
     if (!instruction || !schema) {
+      this.logger.info('ai.extract_completed', {
+        structured: false,
+        durationMs: Date.now() - startedAt
+      });
       return { pageText: snapshot.text };
     }
     const screenshot = options.screenshot
@@ -265,15 +299,79 @@ export class AiRuntime {
         ? { data: new Uint8Array(screenshot), mediaType: 'image/png' }
         : undefined
     });
-    return attachResultMetadata(
-      restoreUrlFields(
-        response.value,
-        transformedSchema.urlPaths,
-        snapshot.urlMap,
-        snapshot.url
-      ),
-      response.usage
-    ) as T;
+    let value = restoreUrlFields(
+      response.value,
+      transformedSchema.urlPaths,
+      snapshot.urlMap,
+      snapshot.url
+    );
+    let completeness: AiExtractCompleteness | undefined;
+    if (options.verifyCompleteness) {
+      const judge = await this.verifyExtractCompleteness(config, instruction, snapshot, options, value);
+      let refined = false;
+      if (!judge.completed && options.refineOnIncomplete) {
+        const refineResponse = await this.completeObject<unknown>(config, {
+          purpose: 'extract-refine',
+          system: [
+            'Extract structured facts from the supplied browser DOM/accessibility snapshot.',
+            'Do not invent facts that are not present.',
+            `The output must match this shape: ${describeSchema(schema)}.`
+          ].join(' '),
+          user: {
+            instruction,
+            context: [options.context, judge.missing.length ? `Previously missing: ${judge.missing.join(', ')}` : undefined]
+              .filter((part): part is string => Boolean(part))
+              .join('\n') || undefined,
+            snapshot: snapshot.text,
+            urlElementIds: Object.keys(snapshot.urlMap)
+          },
+          schema: transformedSchema.schema as z.ZodType<unknown>,
+          timeoutMs: options.timeoutMs,
+          abortSignal: options.abortSignal,
+          providerOptions: options.providerOptions,
+          model: options.model
+        });
+        value = restoreUrlFields(
+          refineResponse.value,
+          transformedSchema.urlPaths,
+          snapshot.urlMap,
+          snapshot.url
+        );
+        refined = true;
+      }
+      completeness = { completed: judge.completed, missing: judge.missing, refined };
+    }
+    this.logger.info('ai.extract_completed', {
+      structured: true,
+      completeness: completeness?.completed,
+      refined: completeness?.refined,
+      durationMs: Date.now() - startedAt
+    });
+    return attachResultMetadata(value, response.usage, completeness) as T;
+  }
+
+  private async verifyExtractCompleteness(
+    config: VoleConfig,
+    instruction: string,
+    snapshot: PageSnapshot,
+    options: AiExtractOptions,
+    extracted: unknown
+  ): Promise<{ completed: boolean; missing: string[]; reason: string }> {
+    const response = await this.completeObject<{ completed: boolean; missing: string[]; reason: string }>(config, {
+      purpose: 'extract-completeness',
+      system: [
+        'Judge whether the extracted data fully satisfies the instruction against the supplied browser snapshot.',
+        'Return completed=true only if nothing relevant is missing.',
+        'When incomplete, list the specific missing fields or facts in `missing`.'
+      ].join(' '),
+      user: { instruction, extracted, snapshot: snapshot.text },
+      schema: extractCompletenessSchema,
+      timeoutMs: options.timeoutMs,
+      abortSignal: options.abortSignal,
+      providerOptions: options.providerOptions,
+      model: options.model
+    });
+    return response.value;
   }
 
   async act(input: AiActInput): Promise<AiActResult>;
@@ -286,7 +384,20 @@ export class AiRuntime {
     if (isAiAction(rawInput)) {
       const config = await this.config();
       const deadline = createActDeadline(options.timeoutMs ?? config.runtimeAi.timeoutMs);
-      return this.takeDeterministicAction(rawInput, options, deadline);
+      const startedAt = Date.now();
+      this.logger.info('ai.act_started', {
+        deterministic: true,
+        method: rawInput.method,
+        descriptionHash: hashSensitiveText(rawInput.description)
+      });
+      const result = await this.takeDeterministicAction(rawInput, options, deadline);
+      this.logger.info('ai.act_completed', {
+        success: result.success,
+        deterministic: true,
+        method: result.action,
+        durationMs: Date.now() - startedAt
+      });
+      return result;
     }
     if (
       (typeof rawInput === 'string' && !rawInput.trim()) ||
@@ -308,6 +419,13 @@ export class AiRuntime {
           providerOptions: options.providerOptions
         }
       : rawInput;
+    const startedAt = Date.now();
+    this.logger.info('ai.act_started', {
+      deterministic: false,
+      action: input.action,
+      instructionHash: hashSensitiveText(input.instruction),
+      instructionLength: input.instruction.length
+    });
     const config = await this.config();
     const timeoutMs = input.timeoutMs ?? config.runtimeAi.timeoutMs;
     const deadline = createActDeadline(timeoutMs);
@@ -385,6 +503,13 @@ export class AiRuntime {
           }).catch(() => undefined);
         }
         await this.tryArtifact('act', { input, result });
+        this.logger.info('ai.act_completed', {
+          success: true,
+          cacheStatus: 'HIT',
+          selfHealed: result.selfHealed,
+          actionCount: result.actions.length,
+          durationMs: Date.now() - startedAt
+        });
         return result;
       }
     }
@@ -404,10 +529,23 @@ export class AiRuntime {
       }).catch(() => undefined);
     }
     await this.tryArtifact('act', { input, result });
+    this.logger.info('ai.act_completed', {
+      success: result.success,
+      cacheStatus: result.cacheStatus,
+      selfHealed: result.selfHealed,
+      actionCount: result.actions.length,
+      durationMs: Date.now() - startedAt
+    });
     return result;
   }
 
   async assert(input: AiAssertInput): Promise<AiAssertResult> {
+    const startedAt = Date.now();
+    this.logger.info('ai.assert_started', {
+      kind: input.kind,
+      instructionHash: hashSensitiveText(input.instruction),
+      instructionLength: input.instruction.length
+    });
     const candidates = await this.observe(input.instruction, {
       timeoutMs: input.timeoutMs,
       variables: input.variables,
@@ -494,6 +632,13 @@ export class AiRuntime {
         reason
       };
       const artifactPath = await this.tryArtifact('assert-failed', details);
+      this.logger.error('ai.assert_failed', {
+        message: 'AI assertion failed',
+        kind: input.kind,
+        reasonHash: hashSensitiveText(reason),
+        artifactPath,
+        durationMs: Date.now() - startedAt
+      });
       throw runtimeError('AI_ASSERT_FAILED', `${reason}; artifact=${artifactPath}`, details);
     }
 
@@ -504,6 +649,11 @@ export class AiRuntime {
       reason
     };
     await this.tryArtifact('assert', { input, result });
+    this.logger.info('ai.assert_completed', {
+      kind: input.kind,
+      passed: true,
+      durationMs: Date.now() - startedAt
+    });
     return result;
   }
 
@@ -559,15 +709,17 @@ export class AiRuntime {
       history,
       agentConfig.tools,
       agentConfig.executionModel,
-      agentConfig.excludeTools
+      agentConfig.excludeTools,
+      agentConfig.toolMeta
     );
+    const probe: { observation?: unknown } = {};
     return new ToolLoopAgent({
       model: model.getLanguageModel(modelName),
       instructions: agentConfig.systemPrompt ?? agentSystemPrompt(),
       tools,
       stopWhen: [hasToolCall('done'), stepCountIs(maxSteps)],
       prepareStep: input.callbacks?.prepareStep,
-      onStepFinish: (event) => this.handleAgentStep(input, event),
+      onStepFinish: (event) => this.handleAgentStep(input, event, probe),
       providerOptions: input.providerOptions
     });
   }
@@ -592,13 +744,14 @@ export class AiRuntime {
       history,
       undefined,
       agentConfig.executionModel,
-      agentConfig.excludeTools
+      agentConfig.excludeTools,
+      agentConfig.toolMeta
     );
     const finalizer = new ToolLoopAgent({
       model: model.getLanguageModel(modelName),
       instructions,
       tools: { done: forcedTools.done },
-      toolChoice: { type: 'tool', toolName: 'done' },
+      toolChoice: 'auto',
       stopWhen: hasToolCall('done'),
       providerOptions: input.providerOptions
     });
@@ -666,6 +819,11 @@ export class AiRuntime {
     const history: AiAgentHistoryItem[] = [];
     const maxSteps = input.maxSteps ?? config.runtimeAi.agent.maxSteps;
     const startedAt = Date.now();
+    this.logger.info('ai.agent_started', {
+      instructionHash: hashSensitiveText(input.instruction),
+      instructionLength: input.instruction.length,
+      maxSteps
+    });
     const cache = this.getCache(config);
     const initialSnapshot = await this.snapshot();
     const modelName = agentConfig.model ?? config.runtimeAi.model ?? config.ai.model;
@@ -677,6 +835,7 @@ export class AiRuntime {
         maxSteps,
         customTools: Object.keys(agentConfig.tools ?? {}).sort(),
         excludeTools: [...(agentConfig.excludeTools ?? [])].sort(),
+        toolMeta: agentConfig.toolMeta,
         systemPrompt: agentConfig.systemPrompt,
         providerOptions: input.providerOptions,
         variableDescriptions: variablePromptEntries(input.variables),
@@ -701,7 +860,8 @@ export class AiRuntime {
             cached.history,
             input,
             config,
-            agentConfig.executionModel
+            agentConfig.executionModel,
+            agentConfig.toolMeta
           );
           const result: AiAgentResult = {
             success: true,
@@ -729,6 +889,13 @@ export class AiRuntime {
           }).catch(() => undefined);
           await input.callbacks?.onEvidence?.({ type: 'final', data: result });
           await input.callbacks?.onFinish?.(result);
+          this.logger.info('ai.agent_completed', {
+            success: true,
+            cacheStatus: 'HIT',
+            steps: result.steps,
+            selfHealed: result.selfHealed,
+            durationMs: Date.now() - startedAt
+          });
           return result;
         } catch {
           await cache.deleteAgentTrajectory(cacheKey);
@@ -788,6 +955,13 @@ export class AiRuntime {
       await input.callbacks?.onEvidence?.({ type: 'final', data: result });
       await input.callbacks?.onFinish?.(result);
       await this.tryArtifact('agent', { input, result });
+      this.logger.info('ai.agent_completed', {
+        success: true,
+        cacheStatus: result.cacheStatus,
+        steps: result.steps,
+        selfHealed: result.selfHealed,
+        durationMs: Date.now() - startedAt
+      });
       return result;
     } catch (error) {
       const terminalError = await this.handleAgentTerminalError(input, error, history);
@@ -795,6 +969,15 @@ export class AiRuntime {
         input,
         history,
         error: terminalError.message
+      });
+      this.logger.error('ai.agent_failed', {
+        message: 'AI agent failed',
+        steps: history.length,
+        errorName: terminalError.name,
+        errorCode: terminalError instanceof AiRuntimeError ? terminalError.code : undefined,
+        errorMessageHash: hashSensitiveText(terminalError.message),
+        artifactPath,
+        durationMs: Date.now() - startedAt
       });
       if (terminalError instanceof AiRuntimeError && terminalError.code !== 'AI_AGENT_FAILED') {
         throw terminalError;
@@ -895,7 +1078,8 @@ export class AiRuntime {
     history: AiAgentHistoryItem[],
     customTools?: ToolSet,
     executionModel?: string,
-    excludeTools: string[] = []
+    excludeTools: string[] = [],
+    toolMeta?: Record<string, ToolKind>
   ): ToolSet {
     const recordResult = async (
       name: string,
@@ -913,7 +1097,7 @@ export class AiRuntime {
       await agentInput.callbacks?.onEvidence?.({
         type: name === 'screenshot'
           ? 'screenshot'
-          : verificationTool(name)
+          : verificationTool(name, toolMeta)
             ? 'observation'
             : 'action',
         step: item.step,
@@ -922,12 +1106,13 @@ export class AiRuntime {
       return output;
     };
     const execute = async (name: string, input: Record<string, unknown>): Promise<unknown> => {
+      const startedAt = Date.now();
       let output: unknown;
       try {
         output = name === 'done' &&
           Boolean(input.success ?? input.taskComplete) &&
-          !hasVerificationAfterLastMutation(history)
-          ? { success: false, message: 'Agent must verify the final state before reporting success' }
+          !hasVerificationAfterLastMutation(history, toolMeta)
+          ? { success: false, message: verificationGateMessage() }
           : await withTimeout(
               this.executeAgentTool(name, input, agentInput, config, executionModel),
               config.runtimeAi.agent.toolTimeoutMs,
@@ -942,7 +1127,17 @@ export class AiRuntime {
           error: error instanceof Error ? error.message : String(error)
         };
       }
-      return recordResult(name, input, output);
+      const result = await recordResult(name, input, output);
+      this.logger.info('ai.agent_tool_completed', {
+        tool: name,
+        step: history.length,
+        success: !(
+          output && typeof output === 'object' &&
+          ('error' in output || (output as { success?: unknown }).success === false)
+        ),
+        durationMs: Date.now() - startedAt
+      });
+      return result;
     };
     const wrappedCustomTools = Object.fromEntries(
       Object.entries(customTools ?? {}).map(([name, customTool]) => {
@@ -1116,7 +1311,8 @@ export class AiRuntime {
     cachedHistory: AiAgentHistoryItem[],
     input: AiAgentInput,
     config: VoleConfig,
-    executionModel?: string
+    executionModel?: string,
+    toolMeta?: Record<string, ToolKind>
   ): Promise<AiAgentHistoryItem[]> {
     const history: AiAgentHistoryItem[] = [];
     for (const item of transformHistoryVariables(cachedHistory, input.variables, 'hydrate')) {
@@ -1139,7 +1335,7 @@ export class AiRuntime {
       history.push(replayedItem);
       await input.callbacks?.onToolFinish?.(replayedItem);
     }
-    if (!hasVerificationAfterLastMutation(history)) {
+    if (!hasVerificationAfterLastMutation(history, toolMeta)) {
       throw runtimeError('AI_AGENT_FAILED', 'cached trajectory did not verify the final state');
     }
     return history;
@@ -1200,26 +1396,33 @@ export class AiRuntime {
 
   private async handleAgentStep(
     input: AiAgentInput,
-    event: StepResult<ToolSet, Record<string, unknown>>
+    event: StepResult<ToolSet, Record<string, unknown>>,
+    probe: { observation?: unknown } = {}
   ): Promise<void> {
     await input.callbacks?.onStepFinish?.(event);
     if (!input.callbacks?.onEvidence) {
       return;
     }
+    const stepMutated = event.toolCalls.some((call) => !NON_MUTATING_STEP_TOOLS.has(call.toolName));
     let observation: unknown;
-    try {
-      const snapshot = await this.snapshot();
-      const screenshot = await this.page.screenshot({ fullPage: false });
-      observation = {
-        url: snapshot.url,
-        tree: snapshot.text,
-        screenshotBase64: screenshot.toString('base64')
-      };
-    } catch (error) {
-      observation = {
-        url: this.page.url(),
-        error: error instanceof Error ? error.message : String(error)
-      };
+    if (!stepMutated && probe.observation !== undefined) {
+      observation = probe.observation;
+    } else {
+      try {
+        const snapshot = await this.snapshot();
+        const screenshot = await this.page.screenshot({ fullPage: false });
+        observation = {
+          url: snapshot.url,
+          tree: snapshot.text,
+          screenshotBase64: screenshot.toString('base64')
+        };
+        probe.observation = observation;
+      } catch (error) {
+        observation = {
+          url: this.page.url(),
+          error: error instanceof Error ? error.message : String(error)
+        };
+      }
     }
     await input.callbacks.onEvidence({
       type: 'step_finished',
@@ -1255,6 +1458,7 @@ export class AiRuntime {
   async close(): Promise<void> {
     await this.snapshotter?.close();
     await this.executor?.close();
+    await this.logger.flush();
   }
 
   private async planAndExecute(
@@ -1818,7 +2022,7 @@ export class AiRuntime {
   }
 
   private getModel(config: VoleConfig): RuntimeModel {
-    this.model ??= this.options.model ?? new RuntimeModelClient(config);
+    this.model ??= this.options.model ?? new RuntimeModelClient(config, { logger: this.logger });
     return this.model;
   }
 
@@ -2169,15 +2373,20 @@ function restoreUrlPath(
 
 function attachResultMetadata(
   value: unknown,
-  usage: ModelObjectResult<unknown>['usage']
+  usage: ModelObjectResult<unknown>['usage'],
+  completeness?: AiExtractCompleteness
 ): unknown {
   if (!value || typeof value !== 'object') {
     return value;
   }
-  Object.defineProperties(value, {
+  const descriptors: Record<string, PropertyDescriptor> = {
     cacheStatus: { value: 'MISS', enumerable: false },
     usage: { value: usage, enumerable: false }
-  });
+  };
+  if (completeness) {
+    descriptors.completeness = { value: completeness, enumerable: false };
+  }
+  Object.defineProperties(value, descriptors);
   return value;
 }
 
@@ -2337,9 +2546,49 @@ function toRuntimeUsage(usage: {
   };
 }
 
-function verificationTool(name: string): boolean {
-  return ['observe', 'ariaTree', 'assert', 'extract'].includes(name);
+const BUILT_IN_TOOL_META: Record<string, ToolKind> = {
+  observe: 'verify',
+  ariaTree: 'verify',
+  assert: 'verify',
+  extract: 'verify',
+  act: 'mutate',
+  fillForm: 'mutate',
+  goto: 'mutate',
+  keys: 'mutate',
+  pressKey: 'mutate',
+  scroll: 'mutate',
+  navback: 'mutate',
+  navBack: 'mutate',
+  goBack: 'mutate',
+  wait: 'mutate',
+  done: 'neutral',
+  think: 'neutral',
+  screenshot: 'neutral'
+};
+
+function classifyTool(name: string, overrides?: Record<string, ToolKind>): ToolKind {
+  return overrides?.[name] ?? BUILT_IN_TOOL_META[name] ?? 'neutral';
 }
+
+function verificationTool(name: string, overrides?: Record<string, ToolKind>): boolean {
+  return classifyTool(name, overrides) === 'verify';
+}
+
+function verificationGateMessage(): string {
+  const verifyTools = Object.keys(BUILT_IN_TOOL_META)
+    .filter((name) => BUILT_IN_TOOL_META[name] === 'verify');
+  return `Agent must verify the final state before reporting success. Call one of: ${
+    verifyTools.join(', ')
+  }. Then call done again.`;
+}
+
+// Agent tools that do not change the page snapshot. When the just-finished step
+// only ran these, handleAgentStep reuses the previous observation instead of
+// re-capturing a fresh DOM/AX snapshot + screenshot. Unknown and custom tools
+// are treated as mutating (conservative) so a stale view is never served.
+const NON_MUTATING_STEP_TOOLS = new Set([
+  'think', 'screenshot', 'observe', 'ariaTree', 'extract', 'assert', 'done'
+]);
 
 function shouldTerminateAgentTool(error: unknown): boolean {
   if (error instanceof AiRuntimeError) {
@@ -2453,16 +2702,17 @@ function redactEmbeddedVariables(value: unknown): unknown {
   );
 }
 
-function hasVerificationAfterLastMutation(history: AiAgentHistoryItem[]): boolean {
-  const verificationTools = new Set(['observe', 'ariaTree', 'assert', 'extract']);
-  const nonMutationTools = new Set(['done', 'think', 'screenshot']);
+function hasVerificationAfterLastMutation(
+  history: AiAgentHistoryItem[],
+  overrides?: Record<string, ToolKind>
+): boolean {
   let lastVerification = -1;
   let lastMutation = -1;
   for (const [index, item] of history.entries()) {
-    if (verificationTools.has(item.tool)) {
+    const kind = classifyTool(item.tool, overrides);
+    if (kind === 'verify') {
       lastVerification = index;
-    }
-    if (!verificationTools.has(item.tool) && !nonMutationTools.has(item.tool)) {
+    } else if (kind === 'mutate') {
       lastMutation = index;
     }
   }

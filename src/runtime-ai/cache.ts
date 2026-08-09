@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { runtimeLogger } from '../logging/context.js';
 import { ensureDir, pathExists } from '../utils/fs.js';
 import type {
   AiAction,
@@ -84,8 +85,10 @@ export class AiRuntimeCache {
   }
 
   async get(key: string): Promise<CachedAction | undefined> {
+    const logger = runtimeLogger().child({ component: 'ai-cache' });
     const filePath = this.filePath(key);
     if (!(await pathExists(filePath))) {
+      logger.debug('ai.cache_miss', { cacheKind: 'action', key });
       return undefined;
     }
     let raw: string;
@@ -102,8 +105,10 @@ export class AiRuntimeCache {
       return undefined;
     }
     if (value.version !== CACHE_VERSION || value.key !== key) {
+      logger.debug('ai.cache_stale', { cacheKind: 'action', key });
       return undefined;
     }
+    logger.debug('ai.cache_hit', { cacheKind: 'action', key });
     return value;
   }
 
@@ -124,8 +129,10 @@ export class AiRuntimeCache {
   }
 
   async getAgentTrajectory(key: string): Promise<CachedAgentTrajectory | undefined> {
+    const logger = runtimeLogger().child({ component: 'ai-cache' });
     const filePath = this.trajectoryFilePath(key);
     if (!(await pathExists(filePath))) {
+      logger.debug('ai.cache_miss', { cacheKind: 'agent', key });
       return undefined;
     }
     let raw: string;
@@ -141,11 +148,13 @@ export class AiRuntimeCache {
       await this.evictCorrupt(filePath, error);
       return undefined;
     }
-    return value.version === CACHE_VERSION &&
+    const valid = value.version === CACHE_VERSION &&
       value.key === key &&
       Array.isArray(value.history)
       ? value
       : undefined;
+    logger.debug(valid ? 'ai.cache_hit' : 'ai.cache_stale', { cacheKind: 'agent', key });
+    return valid;
   }
 
   async setAgentTrajectory(
@@ -172,7 +181,11 @@ export class AiRuntimeCache {
 
   private async evictCorrupt(filePath: string, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[vole] discarding unreadable cache file ${filePath}: ${message}`);
+    runtimeLogger().child({ component: 'ai-cache' }).warn('ai.cache_corrupt', {
+      message: `Discarding unreadable cache file: ${message}`,
+      cachePath: filePath,
+      error
+    });
     await unlink(filePath).catch(() => undefined);
   }
 

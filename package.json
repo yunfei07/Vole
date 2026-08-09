@@ -21,7 +21,7 @@
     "test:live-ai": "tsc -p tsconfig.json && node --test tests/live/runtime-ai-live.test.mjs"
   },
   "dependencies": {
-    "@ai-sdk/openai-compatible": "^3.0.12",
+    "@ai-sdk/openai-compatible": "^3.0.27",
     "@playwright/test": "^1.52.0",
     "ai": "^7.0.31",
     "better-sqlite3": "^11.10.0",

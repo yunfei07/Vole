@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import path from 'node:path';
+import { getLogger } from '../logging/context.js';
 import { ensureDir } from '../utils/fs.js';
 import { stableId } from '../utils/id.js';
 import type { TestPlan } from '../cases/test-plan-schema.js';
@@ -126,6 +127,7 @@ export function updateResolvedPlanByName(db: Database.Database, name: string, re
 }
 
 export function saveRunResult(db: Database.Database, input: RunResultInput): string {
+  const startedAt = Date.now();
   const id = stableId('run', [input.specPath, input.startedAt]);
 
   db.prepare(
@@ -148,6 +150,13 @@ export function saveRunResult(db: Database.Database, input: RunResultInput): str
     screenshot_path: input.screenshotPath ?? null,
     started_at: input.startedAt,
     finished_at: input.finishedAt ?? null
+  });
+
+  getLogger().child({ component: 'kb' }).info('kb.run_saved', {
+    runId: id,
+    status: input.status,
+    errorType: input.errorType,
+    durationMs: Date.now() - startedAt
   });
 
   return id;
@@ -174,18 +183,28 @@ export function getRunResult(db: Database.Database, id: string): RunResultRow | 
 }
 
 export async function openKb(dbPath: string): Promise<Database.Database> {
+  const logger = getLogger().child({ component: 'kb' });
+  const startedAt = Date.now();
   await ensureDir(path.dirname(dbPath));
   const db = new Database(dbPath);
   try {
     migrateDatabase(db);
+    logger.info('kb.opened', { dbPath, durationMs: Date.now() - startedAt });
     return db;
   } catch (error) {
     db.close();
+    logger.error('kb.open_failed', {
+      message: 'Failed to open knowledge base',
+      dbPath,
+      durationMs: Date.now() - startedAt,
+      error
+    });
     throw error;
   }
 }
 
 export function importDraft(db: Database.Database, draft: KbDraft): { pageId: string; importedElements: number; importedActions: number } {
+  const startedAt = Date.now();
   const now = new Date().toISOString();
   const pageId = stableId('page', [draft.page.name, draft.page.url]);
 
@@ -294,11 +313,18 @@ export function importDraft(db: Database.Database, draft: KbDraft): { pageId: st
   });
 
   const importedPageId = transaction() as string;
-  return {
+  const result = {
     pageId: importedPageId,
     importedElements: draft.elements.length,
     importedActions: draft.businessActions.length
   };
+  getLogger().child({ component: 'kb' }).info('kb.draft_imported', {
+    pageId: result.pageId,
+    importedElements: result.importedElements,
+    importedActions: result.importedActions,
+    durationMs: Date.now() - startedAt
+  });
+  return result;
 }
 
 export function listPages(db: Database.Database): PageRow[] {

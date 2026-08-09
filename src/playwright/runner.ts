@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { getLogger, internalLogEnvironment } from '../logging/context.js';
+import { hashSensitiveText } from '../logging/logger.js';
 import { ensureDir, pathExists } from '../utils/fs.js';
 
 export type PlaywrightRunResult = {
@@ -48,31 +50,46 @@ export async function runPlaywrightSpec(
   specPath: string,
   options: { artifactsDir: string }
 ): Promise<PlaywrightRunResult> {
+  const logger = getLogger().child({ component: 'playwright' });
   const startedAt = new Date().toISOString();
   const reportPath = path.resolve(cwd, options.artifactsDir, 'results', `${safeName(specPath)}-${Date.now()}.json`);
   await ensureDir(path.dirname(reportPath));
 
+  logger.info('playwright.run_started', { specPath, reportPath });
   const exitCode = await runCommand(cwd, specPath, reportPath);
   const finishedAt = new Date().toISOString();
   const report = await readReport(reportPath);
   const failedResult = firstFailedResult(report);
   const attachments = failedResult?.attachments ?? [];
 
-  return {
+  const errorMessage = failedResult?.error?.message ?? failedResult?.errors?.[0]?.message;
+  const result: PlaywrightRunResult = {
     specPath,
     status: exitCode === 0 ? 'passed' : 'failed',
     exitCode,
     reportPath,
     errorType: failedResult ? classifyError(failedResult.error?.message ?? failedResult.errors?.[0]?.message ?? '') : undefined,
-    errorMessage: failedResult?.error?.message ?? failedResult?.errors?.[0]?.message,
+    errorMessage,
     tracePath: attachments.find((item) => item.name === 'trace')?.path,
     screenshotPath: attachments.find((item) => item.name === 'screenshot')?.path,
     startedAt,
     finishedAt
   };
+  logger.info('playwright.run_completed', {
+    status: result.status,
+    exitCode,
+    reportPath,
+    errorType: result.errorType,
+    errorMessageHash: errorMessage ? hashSensitiveText(errorMessage) : undefined,
+    tracePath: result.tracePath,
+    screenshotPath: result.screenshotPath,
+    durationMs: Date.parse(finishedAt) - Date.parse(startedAt)
+  });
+  return result;
 }
 
 function runCommand(cwd: string, specPath: string, reportPath: string): Promise<number> {
+  const logger = getLogger().child({ component: 'playwright' });
   const cliPath = createRequire(import.meta.url).resolve('@playwright/test/cli');
   const args = [cliPath, 'test', specPath, '--reporter=json'];
 
@@ -81,10 +98,13 @@ function runCommand(cwd: string, specPath: string, reportPath: string): Promise<
       cwd,
       env: {
         ...process.env,
+        ...internalLogEnvironment(getLogger()),
         PLAYWRIGHT_JSON_OUTPUT_NAME: reportPath
       },
       stdio: ['ignore', 'pipe', 'pipe']
     });
+
+    logger.info('playwright.process_started', { childPid: child.pid, specPath });
 
     child.stdout.on('data', (chunk: Buffer) => {
       process.stdout.write(chunk);
@@ -92,8 +112,15 @@ function runCommand(cwd: string, specPath: string, reportPath: string): Promise<
     child.stderr.on('data', (chunk: Buffer) => {
       process.stderr.write(chunk);
     });
-    child.on('error', reject);
+    child.on('error', (error) => {
+      logger.error('playwright.process_failed', {
+        message: 'Failed to start Playwright process',
+        error
+      });
+      reject(error);
+    });
     child.on('close', (code) => {
+      logger.info('playwright.process_exited', { childPid: child.pid, exitCode: code ?? 1 });
       resolve(code ?? 1);
     });
   });

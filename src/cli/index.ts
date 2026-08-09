@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
+import { runLoggedCommand, wasErrorLogged } from '../logging/cli.js';
 import { authLoginCommand } from './commands/auth-login.js';
 import { caseBuildCommand } from './commands/case-build.js';
 import { caseCompileCommand } from './commands/case-compile.js';
@@ -12,6 +13,7 @@ import { kbImportCommand } from './commands/kb-import.js';
 import { kbListCommand } from './commands/kb-list.js';
 import { kbScanCommand } from './commands/kb-scan.js';
 import { runCommand } from './commands/run.js';
+import { actCommand, agentCommand } from './commands/runtime-ai.js';
 
 const program = new Command();
 
@@ -21,13 +23,13 @@ program
   .version('0.1.0');
 
 program.command('init').description('Initialize vole project files').action(async () => {
-  await initCommand();
+  await runLoggedCommand('init', () => initCommand());
 });
 
 const auth = program.command('auth').description('Authentication commands');
 
 auth.command('login').description('Login with configured username/password and save storage state').action(async () => {
-  await authLoginCommand();
+  await runLoggedCommand('auth.login', () => authLoginCommand());
 });
 
 const kb = program.command('kb').description('Knowledge base commands');
@@ -36,7 +38,7 @@ kb.command('audit')
   .description('Audit knowledge-base quality and semantic consistency')
   .option('--page <name>', 'filter elements by page name')
   .action(async (options: { page?: string }) => {
-    await kbAuditCommand(options);
+    await runLoggedCommand('kb.audit', () => kbAuditCommand(options));
   });
 
 kb.command('scan')
@@ -49,14 +51,14 @@ kb.command('scan')
   .option('--headed', 'run browser headed')
   .option('--wait <ms>', 'override pageReady.waitAfterLoadMs for this scan')
   .action(async (options: { name?: string; url?: string; all?: boolean; import?: boolean; out?: string; headed?: boolean; wait?: string }) => {
-    await kbScanCommand(options);
+    await runLoggedCommand('kb.scan', () => kbScanCommand(options));
   });
 
 kb.command('import')
   .description('Import a knowledge-base draft')
   .argument('<draftPath>', 'draft JSON path')
   .action(async (draftPath: string) => {
-    await kbImportCommand(draftPath);
+    await runLoggedCommand('kb.import', () => kbImportCommand(draftPath));
   });
 
 kb.command('list')
@@ -64,7 +66,7 @@ kb.command('list')
   .argument('<target>', 'pages | elements | actions | runs')
   .option('--page <name>', 'filter elements by page name')
   .action(async (target: string, options: { page?: string }) => {
-    await kbListCommand(target, options);
+    await runLoggedCommand('kb.list', () => kbListCommand(target, options));
   });
 
 const caseCommand = program.command('case').description('Case commands');
@@ -76,13 +78,14 @@ caseCommand
   .option('--parser <parser>', 'ai | rules', 'ai')
   .option('--out <path>', 'plan output path')
   .action(async (casePath: string, options: { parser?: string; out?: string }) => {
-    if (options.parser !== undefined && !['ai', 'rules'].includes(options.parser)) {
-      throw new Error('--parser must be one of: ai, rules');
-    }
-
-    await caseCompileCommand(casePath, {
-      parser: options.parser as 'ai' | 'rules' | undefined,
-      out: options.out
+    await runLoggedCommand('case.compile', async () => {
+      if (options.parser !== undefined && !['ai', 'rules'].includes(options.parser)) {
+        throw new Error('--parser must be one of: ai, rules');
+      }
+      await caseCompileCommand(casePath, {
+        parser: options.parser as 'ai' | 'rules' | undefined,
+        out: options.out
+      });
     });
   });
 
@@ -92,7 +95,7 @@ caseCommand
   .argument('<planPath>', 'plan JSON path')
   .option('--out <path>', 'resolved plan output path')
   .action(async (planPath: string, options: { out?: string }) => {
-    await caseResolveCommand(planPath, options);
+    await runLoggedCommand('case.resolve', () => caseResolveCommand(planPath, options));
   });
 
 caseCommand
@@ -103,7 +106,7 @@ caseCommand
   .option('--page-object-out <path>', 'page object output path')
   .option('--overwrite', 'overwrite existing generated files')
   .action(async (resolvedPlanPath: string, options: { out?: string; pageObjectOut?: string; overwrite?: boolean }) => {
-    await caseGenerateCommand(resolvedPlanPath, options);
+    await runLoggedCommand('case.generate', () => caseGenerateCommand(resolvedPlanPath, options));
   });
 
 caseCommand
@@ -126,26 +129,63 @@ caseCommand
         overwrite?: boolean;
       }
     ) => {
-      if (options.parser !== undefined && !['ai', 'rules'].includes(options.parser)) {
-        throw new Error('--parser must be one of: ai, rules');
-      }
-
-      await caseBuildCommand(casePath, {
-        parser: options.parser as 'ai' | 'rules' | undefined,
-        all: options.all,
-        out: options.out,
-        pageObjectOut: options.pageObjectOut,
-        overwrite: options.overwrite
+      await runLoggedCommand('case.build', async () => {
+        if (options.parser !== undefined && !['ai', 'rules'].includes(options.parser)) {
+          throw new Error('--parser must be one of: ai, rules');
+        }
+        await caseBuildCommand(casePath, {
+          parser: options.parser as 'ai' | 'rules' | undefined,
+          all: options.all,
+          out: options.out,
+          pageObjectOut: options.pageObjectOut,
+          overwrite: options.overwrite
+        });
       });
     }
   );
+
+program
+  .command('act')
+  .description('Perform one AI-guided browser action')
+  .argument('<instruction>', 'natural-language browser action')
+  .option('--url <url>', 'page URL or path; defaults to configured baseUrl')
+  .option('--headed', 'run browser headed')
+  .option('--model <model>', 'override the configured model')
+  .option('--timeout <ms>', 'override the AI action timeout')
+  .action(async (instruction: string, options: {
+    url?: string;
+    headed?: boolean;
+    model?: string;
+    timeout?: string;
+  }) => {
+    await runLoggedCommand('act', () => actCommand(instruction, options));
+  });
+
+program
+  .command('agent')
+  .description('Run a multi-step AI browser task')
+  .argument('<instruction>', 'natural-language browser task')
+  .option('--url <url>', 'page URL or path; defaults to configured baseUrl')
+  .option('--headed', 'run browser headed')
+  .option('--model <model>', 'override the configured model')
+  .option('--timeout <ms>', 'override the agent timeout')
+  .option('--max-steps <count>', 'override the maximum agent steps')
+  .action(async (instruction: string, options: {
+    url?: string;
+    headed?: boolean;
+    model?: string;
+    timeout?: string;
+    maxSteps?: string;
+  }) => {
+    await runLoggedCommand('agent', () => agentCommand(instruction, options));
+  });
 
 program
   .command('run')
   .description('Run a generated Playwright spec and save run result')
   .argument('<specPath>', 'generated spec path')
   .action(async (specPath: string) => {
-    await runCommand(specPath);
+    await runLoggedCommand('run', () => runCommand(specPath));
   });
 
 program
@@ -153,11 +193,13 @@ program
   .description('Diagnose a run id or Playwright JSON report')
   .argument('<target>', 'run id or report path')
   .action(async (target: string) => {
-    await diagnoseCommand(target);
+    await runLoggedCommand('diagnose', () => diagnoseCommand(target));
   });
 
 program.parseAsync(process.argv).catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  console.error(message);
+  if (!wasErrorLogged(error)) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(message);
+  }
   process.exitCode = 1;
 });

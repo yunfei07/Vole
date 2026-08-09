@@ -17,6 +17,7 @@ import {
   updateResolvedPlanByName
 } from '../../kb/repository.js';
 import { resolvePlan } from '../../resolver/resolver.js';
+import { getLogger } from '../../logging/context.js';
 import type { ResolvedPlan } from '../../resolver/types.js';
 import { ensureDir, writeJsonFile } from '../../utils/fs.js';
 import { slugify } from '../../utils/id.js';
@@ -58,6 +59,7 @@ export async function caseBuildCommand(casePath: string | undefined, options: Ca
 }
 
 async function buildManyCases(casePaths: string[], options: CaseBuildOptions, cwd: string): Promise<void> {
+  const logger = getLogger().child({ component: 'case-build' });
   const failures: Array<{ casePath: string; message: string }> = [];
   console.log(`批量构建用例：${casePaths.length} 个`);
 
@@ -71,7 +73,12 @@ async function buildManyCases(casePaths: string[], options: CaseBuildOptions, cw
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       failures.push({ casePath, message });
-      console.error(`构建失败：${message}`);
+      logger.error('case.build_item_failed', {
+        message: 'Case build item failed',
+        terminalMessage: `构建失败：${message}`,
+        casePath: path.relative(cwd, casePath),
+        error
+      });
     }
   }
 
@@ -81,7 +88,11 @@ async function buildManyCases(casePaths: string[], options: CaseBuildOptions, cw
 
   if (failures.length > 0) {
     for (const failure of failures) {
-      console.error(`- ${path.relative(cwd, failure.casePath)}: ${failure.message}`);
+      logger.error('case.build_item_summary', {
+        message: 'Case build item failed',
+        terminalMessage: `- ${path.relative(cwd, failure.casePath)}: ${failure.message}`,
+        casePath: path.relative(cwd, failure.casePath)
+      });
     }
     throw new Error(`CASE_BUILD_FAILED: ${failures.length}/${casePaths.length} cases failed`);
   }
@@ -93,10 +104,20 @@ async function buildOneCase(
   cwd: string,
   config: Awaited<ReturnType<typeof loadConfig>>
 ): Promise<void> {
+  const logger = getLogger().child({ component: 'case-build' });
+  const buildStartedAt = Date.now();
   const resolvedCasePath = resolveFromCwd(cwd, casePath);
+  const parseStartedAt = Date.now();
   const parsedCase = await parseMarkdownCase(resolvedCasePath);
+  logger.info('case.parse_completed', { durationMs: Date.now() - parseStartedAt });
   const parser = options.parser ?? 'ai';
+  const compileStartedAt = Date.now();
   const plan = await compile(parser, config, parsedCase);
+  logger.info('case.compile_completed', {
+    parser,
+    stepCount: plan.steps.length,
+    durationMs: Date.now() - compileStartedAt
+  });
   const planPath = path.resolve(cwd, '.vole/generated/plans', `${slugify(plan.name) || 'case'}.plan.json`);
   const resolvedPlanPath = planPath.replace(/\.plan\.json$/u, '.resolved.json');
 
@@ -112,6 +133,12 @@ async function buildOneCase(
     });
 
     const resolvedPlan = resolvePlanWithCurrentKb(db, plan, config.runtimeAi.enabled);
+    logger.info('case.resolve_completed', {
+      status: resolvedPlan.status,
+      resolved: resolvedPlan.summary.resolved,
+      aiFallback: resolvedPlan.summary.aiFallback,
+      total: resolvedPlan.summary.total
+    });
     await writeJsonFile(resolvedPlanPath, resolvedPlan);
     updateResolvedPlanByName(db, plan.name, resolvedPlan);
 
@@ -140,10 +167,18 @@ async function buildOneCase(
         pageObjectOut: options.pageObjectOut
       }
     );
+    logger.info('case.generate_completed', {
+      specPath: path.relative(cwd, generated.specPath),
+      pageObjectPath: path.relative(cwd, generated.pageObjectPath)
+    });
 
     await writeGeneratedFile(generated.pageObjectPath, generated.pageObjectSource, options.overwrite);
     await writeGeneratedFile(generated.specPath, generated.specSource, options.overwrite);
     await validateGeneratedTypescript(cwd, [generated.pageObjectPath, generated.specPath]);
+    logger.info('case.validate_completed', {
+      durationMs: Date.now() - buildStartedAt,
+      outcome: 'success'
+    });
 
     console.log(`用例：${plan.name}`);
     console.log(`解析器：${parser}`);

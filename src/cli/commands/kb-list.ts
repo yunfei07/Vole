@@ -1,6 +1,7 @@
 import { loadConfig } from '../../config/load-config.js';
 import { listActions, listElements, listPages, listRunResults, openKb } from '../../kb/repository.js';
 import { resolveFromCwd } from '../../utils/paths.js';
+import { getLogger } from '../../logging/context.js';
 
 export type KbListOptions = {
   page?: string;
@@ -12,8 +13,10 @@ export async function kbListCommand(target: string, options: KbListOptions, cwd 
 
   try {
     if (target === 'pages') {
+      const rows = listPages(db);
+      getLogger().child({ component: 'kb' }).info('kb.query_completed', { target, count: rows.length });
       console.table(
-        listPages(db).map((page) => ({
+        rows.map((page) => ({
           id: page.id,
           name: page.name,
           url: page.url,
@@ -24,8 +27,10 @@ export async function kbListCommand(target: string, options: KbListOptions, cwd 
     }
 
     if (target === 'elements') {
+      const rows = listElements(db, options.page);
+      getLogger().child({ component: 'kb' }).info('kb.query_completed', { target, count: rows.length });
       console.table(
-        listElements(db, options.page).map((element) => ({
+        rows.map((element) => ({
           id: element.id,
           page: element.page_name,
           name: element.semantic_name,
@@ -42,8 +47,10 @@ export async function kbListCommand(target: string, options: KbListOptions, cwd 
     }
 
     if (target === 'actions') {
+      const rows = listActions(db);
+      getLogger().child({ component: 'kb' }).info('kb.query_completed', { target, count: rows.length });
       console.table(
-        listActions(db).map((action) => ({
+        rows.map((action) => ({
           id: action.id,
           name: action.name,
           page: action.page_name ?? '',
@@ -54,8 +61,10 @@ export async function kbListCommand(target: string, options: KbListOptions, cwd 
     }
 
     if (target === 'runs') {
+      const rows = listRunResults(db);
+      getLogger().child({ component: 'kb' }).info('kb.query_completed', { target, count: rows.length });
       console.table(
-        listRunResults(db).map((run) => ({
+        rows.map((run) => ({
           id: run.id,
           spec: run.spec_path,
           status: run.status,

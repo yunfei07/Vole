@@ -8,6 +8,7 @@ import { openKb, saveTestPlan } from '../../kb/repository.js';
 import { ensureDir, writeJsonFile } from '../../utils/fs.js';
 import { slugify } from '../../utils/id.js';
 import { resolveFromCwd } from '../../utils/paths.js';
+import { getLogger } from '../../logging/context.js';
 
 export type CaseCompileOptions = {
   parser?: 'ai' | 'rules';
@@ -15,6 +16,7 @@ export type CaseCompileOptions = {
 };
 
 export async function caseCompileCommand(casePath: string, options: CaseCompileOptions, cwd = process.cwd()): Promise<void> {
+  const startedAt = Date.now();
   const config = await loadConfig(cwd);
   const resolvedCasePath = resolveFromCwd(cwd, casePath);
   const parsedCase = await parseMarkdownCase(resolvedCasePath);
@@ -33,6 +35,13 @@ export async function caseCompileCommand(casePath: string, options: CaseCompileO
       name: plan.name,
       sourceFile: path.relative(cwd, resolvedCasePath),
       plan
+    });
+    getLogger().child({ component: 'case-compile' }).info('case.compile_completed', {
+      parser,
+      planId,
+      stepCount: plan.steps.length,
+      planPath: path.relative(cwd, outPath),
+      durationMs: Date.now() - startedAt
     });
 
     console.log(`用例：${plan.name}`);

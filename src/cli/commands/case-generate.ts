@@ -6,6 +6,7 @@ import { listActions, listElements, listPages, openKb } from '../../kb/repositor
 import type { ResolvedPlan } from '../../resolver/types.js';
 import { readJsonFile } from '../../utils/fs.js';
 import { resolveFromCwd } from '../../utils/paths.js';
+import { getLogger } from '../../logging/context.js';
 
 export type CaseGenerateOptions = {
   out?: string;
@@ -43,6 +44,10 @@ export async function caseGenerateCommand(resolvedPlanPath: string, options: Cas
 
     await writeGeneratedFile(generated.pageObjectPath, generated.pageObjectSource, options.overwrite);
     await writeGeneratedFile(generated.specPath, generated.specSource, options.overwrite);
+    getLogger().child({ component: 'case-generate' }).info('case.generate_completed', {
+      pageObjectPath: path.relative(cwd, generated.pageObjectPath),
+      specPath: path.relative(cwd, generated.specPath)
+    });
 
     console.log(`生成 Page Object：${path.relative(cwd, generated.pageObjectPath)}`);
     console.log(`生成 Spec：${path.relative(cwd, generated.specPath)}`);

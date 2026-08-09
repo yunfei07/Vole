@@ -174,6 +174,14 @@ export type AiExtractOptions = {
   model?: string;
   abortSignal?: AbortSignal;
   providerOptions?: RuntimeProviderOptions;
+  verifyCompleteness?: boolean;
+  refineOnIncomplete?: boolean;
+};
+
+export type AiExtractCompleteness = {
+  completed: boolean;
+  missing: string[];
+  refined: boolean;
 };
 
 export type AiAssertKind =
@@ -252,6 +260,8 @@ export type AiAgentCallbacks = {
   onAbort?: () => void | Promise<void>;
 };
 
+export type ToolKind = 'verify' | 'mutate' | 'neutral';
+
 export type AiAgentConfig = {
   mode?: 'dom';
   model?: string;
@@ -260,6 +270,7 @@ export type AiAgentConfig = {
   systemPrompt?: string;
   tools?: ToolSet;
   excludeTools?: string[];
+  toolMeta?: Record<string, ToolKind>;
 };
 
 export type AiAgentExecuteOptions = AiAgentInput;

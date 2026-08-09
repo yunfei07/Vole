@@ -1,5 +1,6 @@
 node_modules
 dist/
+.claude
 .tmp/
 .vole/
 .DS_Store
@@ -7,7 +8,12 @@ tests/
 pages/
 cases/
 docs/
+dist/
+scripts/
+fixtures/
+CLAUDE.md
 test-results/
 playwright-report/
 src/demo
 vole.config.json
+playwright.config.ts

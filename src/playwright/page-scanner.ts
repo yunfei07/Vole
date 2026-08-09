@@ -7,6 +7,7 @@ import { pathExists } from "../utils/fs.js";
 import { slugify } from "../utils/id.js";
 import { resolveFromCwd } from "../utils/paths.js";
 import { joinUrl } from "../utils/url.js";
+import { getLogger } from "../logging/context.js";
 import { locatorFromStored } from "./locator-factory.js";
 import { waitForPageReady } from "./page-readiness.js";
 import { scopedLocatorPlans, type PlannedScope } from "./scope-planner.js";
@@ -64,6 +65,8 @@ export async function scanPage(
   config: VoleConfig,
   options: ScanPageOptions,
 ): Promise<KbDraft> {
+  const logger = getLogger().child({ component: 'browser' });
+  const startedAt = Date.now();
   const storageStatePath = resolveFromCwd(cwd, config.auth.storageState);
   const contextOptions = {
     ignoreHTTPSErrors: config.playwright.ignoreHTTPSErrors,
@@ -78,7 +81,9 @@ export async function scanPage(
   const page = await context.newPage();
 
   try {
-    await page.goto(joinUrl(config.baseUrl, options.url), {
+    const targetUrl = joinUrl(config.baseUrl, options.url);
+    logger.info('browser.navigation_started', { operation: 'kb-scan', url: targetUrl });
+    await page.goto(targetUrl, {
       waitUntil: "networkidle",
       timeout: config.playwright.timeout,
     });
@@ -87,6 +92,10 @@ export async function scanPage(
 
     const title = await page.title();
     const elements = await scanVisibleElements(page);
+    logger.info('browser.scan_completed', {
+      elementCount: elements.length,
+      durationMs: Date.now() - startedAt
+    });
 
     const draft: KbDraft = {
       version: 1,
@@ -102,6 +111,7 @@ export async function scanPage(
     return enhanceScanDraftWithAi(config, draft);
   } finally {
     await browser.close();
+    logger.info('browser.closed', { operation: 'kb-scan' });
   }
 }
 

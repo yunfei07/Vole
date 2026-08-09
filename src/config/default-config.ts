@@ -1,4 +1,5 @@
 import type { VoleConfig } from './schema.js';
+import { defaultLoggingConfig } from '../logging/config.js';
 
 export const defaultConfig: VoleConfig = {
   projectName: 'admin-e2e',
@@ -8,6 +9,7 @@ export const defaultConfig: VoleConfig = {
   caseDir: 'cases',
   knowledgeBase: '.vole/kb.sqlite',
   artifactsDir: '.vole/artifacts',
+  logging: { ...defaultLoggingConfig },
   scanPages: [
     { name: '订单管理页面', url: '/orders' },
     { name: '用户管理页面', url: '/users' },
@@ -51,6 +53,7 @@ export const defaultConfig: VoleConfig = {
     snapshotMaxChars: 60000,
     cacheDir: '.vole/ai-cache',
     artifactsDir: '.vole/artifacts/ai',
+    thinking: 'disabled',
     agent: {
       maxSteps: 8,
       timeoutMs: 120000,

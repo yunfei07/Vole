@@ -5,6 +5,7 @@ import { listActions, listElements, listPages, openKb, updateResolvedPlanByName 
 import { resolvePlan } from '../../resolver/resolver.js';
 import { readJsonFile, writeJsonFile } from '../../utils/fs.js';
 import { resolveFromCwd } from '../../utils/paths.js';
+import { getLogger } from '../../logging/context.js';
 
 export type CaseResolveOptions = {
   out?: string;
@@ -26,6 +27,15 @@ export async function caseResolveCommand(planPath: string, options: CaseResolveO
 
     await writeJsonFile(outPath, resolvedPlan);
     updateResolvedPlanByName(db, plan.name, resolvedPlan);
+    getLogger().child({ component: 'case-resolve' }).info('case.resolve_completed', {
+      status: resolvedPlan.status,
+      resolved: resolvedPlan.summary.resolved,
+      aiFallback: resolvedPlan.summary.aiFallback,
+      ambiguous: resolvedPlan.summary.ambiguous,
+      unresolved: resolvedPlan.summary.unresolved,
+      total: resolvedPlan.summary.total,
+      outputPath: path.relative(cwd, outPath)
+    });
 
     console.log(`用例：${resolvedPlan.name}`);
     console.log(`状态：${resolvedPlan.status}`);

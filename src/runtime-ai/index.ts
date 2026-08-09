@@ -1,4 +1,5 @@
 export { AiRuntime, createAiRuntime, type CreateAiRuntimeOptions } from './runtime.js';
+export type { VoleLogger } from '../logging/logger.js';
 export { AiRuntimeError, type AiRuntimeErrorCode } from './errors.js';
 export { buildSnapshot, PageSnapshotter } from './snapshot.js';
 export { ActionExecutor } from './action-executor.js';

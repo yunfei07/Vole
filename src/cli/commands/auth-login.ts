@@ -10,6 +10,7 @@ import { loadConfig } from "../../config/load-config.js";
 import { ensureDir } from "../../utils/fs.js";
 import { resolveFromCwd } from "../../utils/paths.js";
 import { joinUrl } from "../../utils/url.js";
+import { getLogger } from "../../logging/context.js";
 
 type StorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
 
@@ -18,7 +19,10 @@ const POST_SUBMIT_SETTLE_TIMEOUT_MS = 5000;
 const STORAGE_STATE_OPTIONS = { indexedDB: true } as const;
 
 export async function authLoginCommand(cwd = process.cwd()): Promise<void> {
+  const logger = getLogger().child({ component: 'browser' });
   const config = await loadConfig(cwd);
+  const startedAt = Date.now();
+  logger.info('browser.launching', { operation: 'auth-login', headless: config.playwright.headless });
   const browser = await chromium.launch({
     headless: config.playwright.headless,
   });
@@ -30,6 +34,7 @@ export async function authLoginCommand(cwd = process.cwd()): Promise<void> {
   const storageStatePath = resolveFromCwd(cwd, config.auth.storageState);
 
   try {
+    logger.info('browser.navigation_started', { url: loginUrl });
     await page.goto(loginUrl, {
       waitUntil: "networkidle",
       timeout: config.playwright.timeout,
@@ -56,9 +61,14 @@ export async function authLoginCommand(cwd = process.cwd()): Promise<void> {
       path: storageStatePath,
     });
     await verifySavedAuthState(browser, config, storageStatePath, page.url());
+    logger.info('auth.login_completed', {
+      storageStatePath,
+      durationMs: Date.now() - startedAt
+    });
     console.log(`Saved auth state: ${storageStatePath}`);
   } finally {
     await browser.close();
+    logger.info('browser.closed', { operation: 'auth-login' });
   }
 }
 

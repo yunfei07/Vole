@@ -14,6 +14,8 @@ import {
 } from 'ai';
 import { z } from 'zod';
 import type { VoleConfig } from '../config/schema.js';
+import { runtimeLogger } from '../logging/context.js';
+import { hashSensitiveText, type VoleLogger } from '../logging/logger.js';
 import { AiRuntimeError, isCancellation, runtimeError } from './errors.js';
 import type { RuntimeModelUsage } from './types.js';
 
@@ -74,27 +76,75 @@ export type ModelCallLog = {
 
 type ModelClientOptions = {
   fetch?: typeof globalThis.fetch;
+  logger?: VoleLogger;
 };
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 type ProviderOptions = Record<string, Record<string, JsonValue>>;
+
+/**
+ * Build the `fetch` passed to the openai-compatible provider. When reasoning
+ * (`config.runtimeAi.thinking`) is configured, every chat-completion request
+ * body gets a `thinking: { type }` field injected. This is the only knob some
+ * providers honor (e.g. ZhipuAI GLM-4.7 on the openai-compatible endpoint,
+ * which defaults to thinking ENABLED and ignores OpenAI's `reasoning_effort`);
+ * injecting it explicitly keeps act/observe/extract inference fast instead of
+ * generating thousands of reasoning tokens. Provider-agnostic: bodies that are
+ * not JSON chat requests are forwarded unchanged.
+ */
+function resolveFetch(
+  config: VoleConfig,
+  options: ModelClientOptions
+): { fetch?: typeof globalThis.fetch } {
+  const thinking = config.runtimeAi.thinking;
+  if (!thinking) {
+    return options.fetch ? { fetch: options.fetch } : {};
+  }
+  const baseFetch = options.fetch ?? globalThis.fetch;
+  return { fetch: createThinkingFetch(thinking, baseFetch) };
+}
+
+function createThinkingFetch(
+  thinking: 'enabled' | 'disabled',
+  baseFetch: typeof globalThis.fetch
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    const body = init?.body;
+    if (typeof body === 'string') {
+      try {
+        const parsed = JSON.parse(body) as { messages?: unknown; thinking?: unknown };
+        if (parsed && typeof parsed === 'object' && 'messages' in parsed) {
+          parsed.thinking = { type: thinking };
+          init = { ...init, body: JSON.stringify(parsed) };
+        }
+      } catch {
+        // body is not JSON; forward unchanged
+      }
+    }
+    return baseFetch(input, init);
+  };
+}
+
+export const modelClientTestExports = { createThinkingFetch };
 
 export class RuntimeModelClient {
   private readonly nativeProvider;
   private readonly promptProvider;
   private readonly callHistory: ModelCallLog[] = [];
   private readonly promptModeModels = new Set<string>();
+  private readonly logger: VoleLogger;
 
   constructor(
     private readonly config: VoleConfig,
     options: ModelClientOptions = {}
   ) {
+    this.logger = runtimeLogger(options.logger).child({ component: 'ai-model' });
     const common = {
       name: 'vole',
       baseURL: config.ai.baseURL.replace(/\/$/, ''),
       apiKey: resolveApiKey(config),
       includeUsage: true,
-      ...(options.fetch ? { fetch: options.fetch } : {})
+      ...resolveFetch(config, options)
     };
     this.nativeProvider = createOpenAICompatible({
       ...common,
@@ -150,8 +200,14 @@ export class RuntimeModelClient {
         isCancellation(error) ||
         !shouldFallbackToPrompt(error)
       ) {
+        this.logFailure(input.purpose, modelName, error);
         throw mapModelError(error, input.purpose);
       }
+      this.logger.warn('ai.model_structured_output_fallback', {
+        message: 'Model structured output is incompatible; retrying in prompt mode',
+        purpose: input.purpose,
+        model: modelName
+      });
       this.promptModeModels.add(cacheKey);
       try {
         const result = await this.runObject(input, modelName, 'prompt');
@@ -165,6 +221,7 @@ export class RuntimeModelClient {
         });
         return result;
       } catch (fallbackError) {
+        this.logFailure(input.purpose, modelName, fallbackError);
         throw mapModelError(fallbackError, input.purpose);
       }
     }
@@ -216,6 +273,7 @@ export class RuntimeModelClient {
       });
       return value;
     } catch (error) {
+      this.logFailure('generateText', input.model ?? this.modelName(), error);
       throw mapModelError(error, 'generateText');
     }
   }
@@ -333,6 +391,8 @@ export class RuntimeModelClient {
     const promptSchema = mode === 'prompt'
       ? await zodSchema(outputSchema as z.ZodTypeAny).jsonSchema
       : undefined;
+    const outputName = safeSchemaName(input.purpose);
+    const outputDescription = `Structured result for ${input.purpose}`;
     const result = await generateText({
       model,
       system: [
@@ -342,11 +402,13 @@ export class RuntimeModelClient {
           : ''
       ].filter(Boolean).join('\n'),
       messages: [{ role: 'user', content: userContent }],
-      output: Output.object<unknown>({
-        schema: outputSchema as z.ZodTypeAny,
-        name: safeSchemaName(input.purpose),
-        description: `Structured result for ${input.purpose}`
-      }),
+      output: mode === 'prompt'
+        ? Output.json({ name: outputName, description: outputDescription })
+        : Output.object<unknown>({
+            schema: outputSchema as z.ZodTypeAny,
+            name: outputName,
+            description: outputDescription
+          }),
       temperature: this.config.ai.temperature,
       ...(input.purpose === 'act' || input.purpose === 'act-second-step'
         ? {
@@ -360,10 +422,13 @@ export class RuntimeModelClient {
       abortSignal: input.abortSignal,
       providerOptions: input.providerOptions
     });
+    const validatedOutput = mode === 'prompt'
+      ? outputSchema.parse(result.output)
+      : result.output;
     return {
       value: (wrapOutput
-        ? (result.output as { result: T }).result
-        : result.output) as T,
+        ? (validatedOutput as { result: T }).result
+        : validatedOutput) as T,
       structuredOutputMode: mode,
       ...metadata(result, startedAt)
     };
@@ -378,6 +443,32 @@ export class RuntimeModelClient {
     if (this.callHistory.length > 100) {
       this.callHistory.splice(0, this.callHistory.length - 100);
     }
+    this.logger.info('ai.model_completed', {
+      purpose: entry.purpose,
+      model: entry.model,
+      kind: entry.kind,
+      structuredOutputMode: entry.structuredOutputMode,
+      durationMs: entry.metadata.durationMs,
+      finishReason: entry.metadata.finishReason,
+      warningCount: entry.metadata.warnings.length,
+      usage: entry.metadata.usage,
+      responseId: entry.metadata.responseId,
+      responseModel: entry.metadata.responseModel
+    });
+  }
+
+  private logFailure(purpose: string, model: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.logger.error('ai.model_failed', {
+      message: 'AI model request failed',
+      purpose,
+      model,
+      errorName: error instanceof Error ? error.name : 'Error',
+      errorCode: error && typeof error === 'object' && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined,
+      errorMessageHash: hashSensitiveText(message)
+    });
   }
 }
 
