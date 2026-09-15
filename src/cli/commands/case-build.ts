@@ -1,9 +1,8 @@
 import { readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { compileCaseWithAi } from '../../ai/intent-parser.js';
+import { buildAgent } from '../../ai/build-agent.js';
 import { parseMarkdownCase } from '../../cases/markdown-parser.js';
 import { compileCaseWithRules } from '../../cases/rule-compiler.js';
-import type { TestPlan } from '../../cases/test-plan-schema.js';
 import { generateTestFiles } from '../../codegen/generator.js';
 import { validateGeneratedTypescript } from '../../codegen/validator.js';
 import { writeGeneratedFile } from '../../codegen/write-files.js';
@@ -107,32 +106,42 @@ async function buildOneCase(
   const logger = getLogger().child({ component: 'case-build' });
   const buildStartedAt = Date.now();
   const resolvedCasePath = resolveFromCwd(cwd, casePath);
-  const parseStartedAt = Date.now();
-  const parsedCase = await parseMarkdownCase(resolvedCasePath);
-  logger.info('case.parse_completed', { durationMs: Date.now() - parseStartedAt });
   const parser = options.parser ?? 'ai';
-  const compileStartedAt = Date.now();
-  const plan = await compile(parser, config, parsedCase);
-  logger.info('case.compile_completed', {
-    parser,
-    stepCount: plan.steps.length,
-    durationMs: Date.now() - compileStartedAt
-  });
-  const planPath = path.resolve(cwd, '.vole/generated/plans', `${slugify(plan.name) || 'case'}.plan.json`);
+  const parseStartedAt = Date.now();
+  const parsedCase = await parseMarkdownCase(resolvedCasePath, { allowGoalOnly: parser === 'ai' });
+  logger.info('case.parse_completed', { durationMs: Date.now() - parseStartedAt });
+  const planPath = path.resolve(cwd, '.vole/generated/plans', `${slugify(parsedCase.name) || 'case'}.plan.json`);
+  const analysisPath = planPath.replace(/\.plan\.json$/u, '.build.json');
   const resolvedPlanPath = planPath.replace(/\.plan\.json$/u, '.resolved.json');
 
   await ensureDir(path.dirname(planPath));
-  await writeJsonFile(planPath, plan);
 
   const db = await openKb(resolveFromCwd(cwd, config.knowledgeBase));
   try {
+    const kb = { pages: listPages(db), elements: listElements(db), actions: listActions(db) };
+    const compileStartedAt = Date.now();
+    const plan = parser === 'rules'
+      ? compileCaseWithRules(parsedCase)
+      : await buildAgent(config, parsedCase, kb, {
+        onAnalysis: async (analysis) => {
+          await writeJsonFile(analysisPath, analysis);
+          console.log(`构建分析：${path.relative(cwd, analysisPath)}`);
+          console.log(`拆解步骤：${analysis.steps.length} 个`);
+        }
+      });
+    logger.info('case.compile_completed', {
+      parser,
+      stepCount: plan.steps.length,
+      durationMs: Date.now() - compileStartedAt
+    });
+    await writeJsonFile(planPath, plan);
     const planId = saveTestPlan(db, {
       name: plan.name,
       sourceFile: path.relative(cwd, resolvedCasePath),
       plan
     });
 
-    const resolvedPlan = resolvePlanWithCurrentKb(db, plan, config.runtimeAi.enabled);
+    const resolvedPlan = resolvePlan(plan, kb, { aiFallback: config.runtimeAi.enabled });
     logger.info('case.resolve_completed', {
       status: resolvedPlan.status,
       resolved: resolvedPlan.summary.resolved,
@@ -148,11 +157,7 @@ async function buildOneCase(
 
     const generated = generateTestFiles(
       resolvedPlan,
-      {
-        pages: listPages(db),
-        elements: listElements(db),
-        actions: listActions(db)
-      },
+      kb,
       {
         cwd,
         testDir: config.testDir,
@@ -204,30 +209,6 @@ async function listConfiguredCases(cwd: string, caseDir: string): Promise<string
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
     .map((entry) => path.join(resolvedCaseDir, entry.name))
     .sort((a, b) => a.localeCompare(b, 'zh-CN'));
-}
-
-async function compile(
-  parser: 'ai' | 'rules',
-  config: Awaited<ReturnType<typeof loadConfig>>,
-  parsedCase: Parameters<typeof compileCaseWithRules>[0]
-): Promise<TestPlan> {
-  if (parser === 'rules') {
-    return compileCaseWithRules(parsedCase);
-  }
-
-  return compileCaseWithAi(config, parsedCase);
-}
-
-function resolvePlanWithCurrentKb(
-  db: Awaited<ReturnType<typeof openKb>>,
-  plan: TestPlan,
-  aiFallback: boolean
-): ResolvedPlan {
-  return resolvePlan(plan, {
-    pages: listPages(db),
-    elements: listElements(db),
-    actions: listActions(db)
-  }, { aiFallback });
 }
 
 function unresolvedPlanError(plan: ResolvedPlan): Error {

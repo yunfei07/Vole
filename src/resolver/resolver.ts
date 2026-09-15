@@ -49,6 +49,12 @@ export function resolvePlan(plan: TestPlan, kb: KnowledgeBaseSnapshot, options: 
 }
 
 function resolveStep(step: TestStep, kb: KnowledgeBaseSnapshot, currentPageName: string | undefined, aiFallback: boolean): ResolveResult {
+  if (step.action === 'assertText' || step.action === 'assertVisible' || step.action === 'assertSemantic') {
+    return resolveFromCandidates(step, [], aiFallback ? 'ai-assert' : undefined);
+  }
+  if (step.action === 'observe' || step.action === 'extract') {
+    return resolveFromCandidates(step, [], aiFallback ? `ai-${step.action}` : undefined);
+  }
   if (step.action === 'goto') {
     return resolveFromCandidates(step, pageCandidates(step.target, kb.pages));
   }
@@ -57,16 +63,13 @@ function resolveStep(step: TestStep, kb: KnowledgeBaseSnapshot, currentPageName:
     return resolveFromCandidates(step, actionCandidates(step.target, kb.actions, currentPageName), aiFallback ? 'ai-agent' : undefined);
   }
 
-  const fallback = step.action === 'assertText' || step.action === 'assertVisible'
-    ? 'ai-assert'
-    : 'ai-act';
-  return resolveFromCandidates(step, elementCandidates(step, kb.elements, currentPageName), aiFallback ? fallback : undefined);
+  return resolveFromCandidates(step, elementCandidates(step, kb.elements, currentPageName), aiFallback ? 'ai-act' : undefined);
 }
 
 function resolveFromCandidates(
   step: TestStep,
   candidates: ResolveCandidate[],
-  fallback?: 'ai-act' | 'ai-agent' | 'ai-assert'
+  fallback?: 'ai-act' | 'ai-agent' | 'ai-assert' | 'ai-observe' | 'ai-extract'
 ): ResolveResult {
   const sorted = uniqueCandidates(candidates)
     .sort((a, b) => b.confidence - a.confidence)

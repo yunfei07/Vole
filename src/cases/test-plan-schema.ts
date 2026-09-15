@@ -48,10 +48,29 @@ export const assertVisibleStepSchema = baseStepSchema.extend({
   target: z.string().min(1)
 });
 
+export const assertSemanticStepSchema = baseStepSchema.extend({
+  action: z.literal('assertSemantic'),
+  target: z.string().min(1),
+  value: z.string().min(1)
+});
+
 export const businessActionStepSchema = baseStepSchema.extend({
   action: z.literal('businessAction'),
   target: z.string().min(1),
   inputs: z.record(z.string()).optional()
+});
+
+export const observeStepSchema = baseStepSchema.extend({
+  action: z.literal('observe')
+});
+
+// Extraction gathers data. Legacy expectations are rendered through ai.assert.
+export const extractStepSchema = baseStepSchema.extend({
+  action: z.literal('extract'),
+  fields: z.record(z.string().regex(/^[A-Za-z][A-Za-z0-9_]*$/), z.object({
+    description: z.string().trim().min(1),
+    expected: z.string().optional()
+  })).refine((fields) => Object.keys(fields).length > 0, 'extract requires at least one field')
 });
 
 export const testStepSchema = z.discriminatedUnion('action', [
@@ -62,7 +81,10 @@ export const testStepSchema = z.discriminatedUnion('action', [
   uploadStepSchema,
   assertTextStepSchema,
   assertVisibleStepSchema,
-  businessActionStepSchema
+  assertSemanticStepSchema,
+  businessActionStepSchema,
+  observeStepSchema,
+  extractStepSchema
 ]);
 
 export const testPlanSchema = z.object({

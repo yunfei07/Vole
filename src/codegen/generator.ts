@@ -48,7 +48,8 @@ export function generateTestFiles(plan: ResolvedPlan, kb: CodegenKb, options: Ge
   const className = 'GeneratedCasePage';
   const stepRenders = plan.steps.map((step, index) => renderStep(plan, step, index, kb, options));
   const usesAi = stepRenders.some((step) => step.usesAi);
-  const pageObjectSource = renderPageObject(className, stepRenders, usesAi ? 'vole/runtime-ai' : undefined);
+  const pageObjectSource = renderPageObject(className, stepRenders, usesAi ? 'vole/runtime-ai' : undefined,
+    plan.steps.some((item) => item.step.action === 'extract'));
   const specSource = renderSpec(plan, className, stepRenders, {
     pageObjectPath,
     specPath,
@@ -66,9 +67,10 @@ export function generateTestFiles(plan: ResolvedPlan, kb: CodegenKb, options: Ge
   };
 }
 
-function renderPageObject(className: string, steps: StepRender[], runtimeImportPath?: string): string {
+function renderPageObject(className: string, steps: StepRender[], runtimeImportPath?: string, usesExtract = false): string {
   return `${[
-    "import { expect, type Locator, type Page } from '@playwright/test';",
+    "import { type Locator, type Page } from '@playwright/test';",
+    usesExtract ? "import { z } from 'zod';" : undefined,
     runtimeImportPath
       ? `import { createAiRuntime, type AiRuntime } from '${runtimeImportPath}';`
       : undefined,
@@ -100,7 +102,7 @@ function renderPageObject(className: string, steps: StepRender[], runtimeImportP
 function renderMethod(step: StepRender): string[] {
   return [
     `  async ${step.methodName}(context: TestContext): Promise<void> {`,
-    `    // ${step.rawText}`,
+    `    // ${step.rawText.replace(/[\r\n]+/g, ' ')}`,
     ...step.body.map((line) => `    ${line}`),
     '  }',
     ''
@@ -142,13 +144,13 @@ function renderSpec(
 function calculateAiTestTimeout(plan: ResolvedPlan, options: GenerateOptions): number {
   return plan.steps.reduce((timeout, item) => {
     if (item.resolution.status !== 'ai_fallback') {
-      return timeout;
+      return timeout + (item.step.action.startsWith('assert') || item.step.action === 'businessAction' ? options.runtimeAiTimeoutMs * 3 : 0);
     }
 
     return timeout + (
       item.resolution.execution === 'ai-agent'
         ? options.agentTimeoutMs
-        : options.runtimeAiTimeoutMs * 2
+        : options.runtimeAiTimeoutMs * (item.step.action === 'assertSemantic' ? 3 : 2)
     );
   }, options.playwrightTimeoutMs);
 }
@@ -157,7 +159,7 @@ function renderStep(plan: ResolvedPlan, resolvedStep: ResolvedStep, index: numbe
   const methodName = `step${String(index + 1).padStart(3, '0')}`;
   const step = resolvedStep.step;
   const matched = resolvedStep.resolution.matched;
-  if (resolvedStep.resolution.status === 'ai_fallback') {
+  if (resolvedStep.resolution.status === 'ai_fallback' || step.action.startsWith('assert')) {
     return renderAiFallback(methodName, resolvedStep);
   }
 
@@ -201,7 +203,7 @@ function renderStep(plan: ResolvedPlan, resolvedStep: ResolvedStep, index: numbe
       methodName,
       rawText: step.rawText,
       body,
-      usesAi: false
+      usesAi: body.some((line) => line.includes('this.ai.'))
     };
   }
 
@@ -221,6 +223,33 @@ function renderStep(plan: ResolvedPlan, resolvedStep: ResolvedStep, index: numbe
 
 function renderAiFallback(methodName: string, resolvedStep: ResolvedStep): StepRender {
   const step = resolvedStep.step;
+  if (step.action === 'observe') {
+    return {
+      methodName, rawText: step.rawText, usesAi: true,
+      body: [
+        `await this.ai.observe(${quote(step.rawText)}, { variables: context });`
+      ]
+    };
+  }
+  if (step.action === 'extract') {
+    const fields = Object.entries(step.fields);
+    if (fields.length === 0) throw new Error(`CODEGEN_FAILED: extract step ${step.id} has no fields`);
+    return {
+      methodName, rawText: step.rawText, usesAi: true,
+      body: [
+        // Do not send expected answers to the extraction model: verify independently below.
+        `const extracted = await this.ai.extract(${quote('从当前可见页面提取以下字段，仅返回页面实际呈现的事实。')}, z.object({`,
+        ...fields.map(([name, field]) => `  [${quote(name)}]: z.string().describe(${quote(field.description)}),`),
+        '}));',
+        ...fields.flatMap(([name, field]) => [
+          ...(field.expected !== undefined ? [
+            `await this.ai.assert({ instruction: ${quote(`${field.description}应为${field.expected}`)}, target: ${quote(field.description)}, kind: 'semantic', expected: ${quote(field.expected)}, variables: context });`
+          ] : []),
+          `context[${quote(name)}] = extracted[${quote(name)}];`
+        ])
+      ]
+    };
+  }
   const common = [
     `instruction: ${quote(step.rawText)}`,
     step.target ? `target: ${quote(step.target)}` : undefined,
@@ -243,14 +272,18 @@ function renderAiFallback(methodName: string, resolvedStep: ResolvedStep): StepR
     return { methodName, rawText: step.rawText, body, usesAi: true };
   }
 
-  if (resolvedStep.resolution.execution === 'ai-assert') {
+  if (step.action.startsWith('assert')) {
     if (step.action === 'assertText') {
       return {
         methodName,
         rawText: step.rawText,
-        body: [`await this.ai.assert({ ${common.join(', ')}, kind: 'text', expected: ${quote(step.value)} });`],
+        body: [`await this.ai.assert({ ${common.join(', ')}, kind: ${quote(step.target.includes('列表') ? 'containsText' : 'text')}, expected: ${quote(step.value)} });`],
         usesAi: true
       };
+    }
+    if (step.action === 'assertSemantic') {
+      return { methodName, rawText: step.rawText, usesAi: true,
+        body: [`await this.ai.assert({ ${common.join(', ')}, kind: 'semantic', expected: ${quote(step.value)} });`] };
     }
     return {
       methodName,
@@ -263,10 +296,21 @@ function renderAiFallback(methodName: string, resolvedStep: ResolvedStep): StepR
   const action = aiActionForStep(step.action);
   const values = [
     ...common,
-    `action: ${quote(action)}`,
+    // Unknown dropdowns may need click-to-open then click-to-select, not selectOption.
+    step.action !== 'select' ? `action: ${quote(action)}` : undefined,
     'value' in step ? `value: ${quote(step.value)}` : undefined,
     step.action === 'upload' ? `filePath: ${quote(step.filePath)}` : undefined
   ].filter((line): line is string => Boolean(line));
+  if (step.action === 'click') {
+    return { methodName, rawText: step.rawText, usesAi: true, body: [
+      `const candidates = await this.ai.observe(${quote(step.rawText)}, { variables: context });`,
+      `const clicks = candidates.filter((candidate) => candidate.method === 'click');`,
+      'const aiResult = clicks.length === 1',
+      `  ? await this.ai.act({ ...clicks[0]!, description: ${quote(step.rawText)} }, { variables: context })`,
+      `  : await this.ai.act({ ${values.join(', ')} });`,
+      'if (!aiResult.success) throw new Error(aiResult.message);'
+    ] };
+  }
   return {
     methodName,
     rawText: step.rawText,
@@ -320,6 +364,11 @@ function renderPrimitive(
     return target === 'type'
       ? [`await this.page.keyboard.type(${quote(value)});`]
       : [`await this.page.keyboard.press(${quote(value || 'Enter')});`];
+  }
+
+  if (action === 'assertText' || action === 'assertVisible' || action === 'assertSemantic') {
+    const kind = action === 'assertVisible' ? 'visible' : action === 'assertSemantic' ? 'semantic' : target.includes('列表') ? 'containsText' : 'text';
+    return [`await this.ai.assert({ instruction: ${quote(`验证${target}${value ? `为${value}` : '可见'}`)}, target: ${quote(target)}, kind: ${quote(kind)}, expected: ${quote(value)}, variables: context });`];
   }
 
   const element = locator ? findElementByLocator(locator, target, kb.elements) : findElement(target, kb.elements);
@@ -378,17 +427,6 @@ function renderPrimitive(
     return ['await this.page.mouse.wheel(0, -Math.round((this.page.viewportSize()?.height ?? 600) * 0.8));'];
   }
 
-  if (action === 'assertText') {
-    if (target.includes('列表')) {
-      return [`await expect(${scoped}).toContainText(${quote(value)});`];
-    }
-
-    return [`await expect(${scoped}).toHaveText(${quote(value)});`];
-  }
-
-  if (action === 'assertVisible') {
-    return [`await expect(${scoped}).toBeVisible();`];
-  }
 
   throw new Error(`CODEGEN_FAILED: unsupported action ${action}`);
 }

@@ -1,7 +1,7 @@
 import type { TestPlan, TestStep } from '../cases/test-plan-schema.js';
 
 export type ResolveStatus = 'resolved' | 'ai_fallback' | 'ambiguous' | 'unresolved';
-export type ExecutionStrategy = 'static' | 'ai-act' | 'ai-agent' | 'ai-assert';
+export type ExecutionStrategy = 'static' | 'ai-act' | 'ai-agent' | 'ai-assert' | 'ai-observe' | 'ai-extract';
 
 export type ResolveCandidate = {
   id: string;
