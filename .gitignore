@@ -4,9 +4,15 @@ dist/
 .tmp/
 .vole/
 .DS_Store
-tests/
+tests/*
+!tests/unit/
+tests/unit/*
+!tests/unit/build-agent.test.mjs
+!tests/unit/case-build.test.mjs
 pages/
-cases/
+cases/*
+!cases/build-agent-settings-goal.md
+!cases/build-agent-runtime-capabilities.md
 docs/
 dist/
 scripts/
