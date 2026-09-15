@@ -111,9 +111,9 @@ caseCommand
 
 caseCommand
   .command('build')
-  .description('Compile, resolve against the static knowledge base, generate code, and validate it')
+  .description('Understand the case goal, plan steps with buildAgent, resolve, generate code, and validate it')
   .argument('[casePath]', 'case markdown path')
-  .option('--parser <parser>', 'ai | rules', 'ai')
+  .option('--parser <parser>', 'ai (two-stage buildAgent, supports goal-only cases) | rules (requires steps)', 'ai')
   .option('--all', 'build all markdown cases configured by caseDir')
   .option('--out <path>', 'spec output path')
   .option('--page-object-out <path>', 'page object output path')
