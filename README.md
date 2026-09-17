@@ -1,416 +1,321 @@
 # Vole
 
-Vole compiles Markdown test cases into reviewable, executable Playwright tests. It resolves pages, elements, and business actions from a local SQLite knowledge base, then uses an optional AI runtime when static data cannot identify a safe action.
+AI 驱动的 Web 自动化测试工具，支持测试意图理解、脚本生成与 Playwright 测试执行。
+
+## 介绍
+
+Vole 面向 Web 应用的端到端测试。你用自然语言描述测试目标和步骤，Vole 结合本地知识库生成 Page Object 和测试脚本，再通过 Playwright 执行并保存结果。
+
+默认的 `case build` 使用 **buildAgent**：先理解目标、拆解操作与断言，再生成结构化计划和脚本。
 
 ```text
-Markdown test case
-        |
-        v
-Goal analysis and step decomposition (buildAgent)
-        |
-        v
-Structured test plan
-        |
-        v
-Static knowledge-base resolution
-        |
-        v
-Playwright code generation
-        |
-        v
-Execution, artifacts, and diagnostics
+Markdown 用例
+  → 目标理解与步骤拆解
+  → TestPlan
+  → 知识库匹配
+  → Playwright 脚本
+  → TypeScript 校验
 ```
 
-Static resolution runs first for actions. All generated assertions use `this.ai.assert` and require runtime AI. Runtime discoveries do not modify the knowledge base or create hidden page state.
+主要能力：
 
-## Features
+- **自然语言用例**：支持详细步骤，也支持只描述目标的用例。
+- **本地知识库**：扫描页面，保存页面、元素和业务动作，优先生成静态 Playwright 操作。
+- **AI 补充执行**：知识库无法匹配操作时，使用 `act`、`observe`、`agent` 等运行时能力。
+- **统一 AI 断言**：生成脚本中的业务断言全部使用 `this.ai.assert`。
+- **可检查的产物**：保存拆解分析、测试计划、源码、执行结果和诊断信息。
 
-- Scan web pages and produce editable knowledge-base drafts.
-- Understand Markdown test goals and decompose them into reviewable steps before compiling structured test plans.
-- Generate Page Objects and Playwright specs from resolved plans.
-- Fall back to AI for unresolved or ambiguous elements and business actions. Use AI assertions for all verification.
-- Run one AI browser action from the CLI or delegate a multi-step task to an agent.
-- Capture Playwright reports, traces, screenshots, AI artifacts, and structured JSONL logs.
-- Correlate CLI, Playwright worker, knowledge-base, and model events with one invocation ID.
+构建阶段不启动浏览器。页面扫描和测试执行阶段会操作浏览器。缺少关键数据或预期结果时，buildAgent 会列出缺失项并停止当前用例的构建。
 
-## Requirements
+## 安装
 
-- Node.js 22
-- npm
-- Chromium supported by Playwright
-- An OpenAI-compatible model and API key for AI features
+### 环境要求
 
-Rebuild the SQLite native module after changing Node.js versions if Node reports an ABI mismatch:
+- Node.js **22.12 或更高版本**。
+- npm 和 Playwright Chromium 浏览器。
+- AI 功能需要支持 OpenAI 兼容接口的模型服务及 API Key；运行时 `agent` 还要求模型支持工具调用。
 
-```bash
-npm rebuild better-sqlite3
-```
-
-## Installation
+在测试项目根目录执行：
 
 ```bash
-npm install
+npm install --save-dev @jeffyang07/vole
 npx playwright install chromium
-npm run build
-node dist/cli/index.js init
+npx vole init
 ```
 
-`init` creates the project configuration, SQLite knowledge base, Playwright configuration, and local runtime directories. It does not overwrite existing files.
+npm 包名是 `@jeffyang07/vole`，命令名是 `vole`。
+
+`init` 创建配置、SQLite 知识库、Playwright 配置及工作目录，保留已有配置文件：
 
 ```text
 .vole/
-  vole.config.json
-  kb.sqlite
-  kb-drafts/
-  generated/
-  auth/
-  ai-cache/
-  artifacts/
-    ai/
-    results/
-  logs/
-cases/
-pages/
-tests/generated/
+  vole.config.json       # 项目配置
+  kb.sqlite              # 本地知识库与运行记录
+  kb-drafts/             # 页面扫描草稿
+  generated/plans/       # 分析与测试计划
+  auth/                  # 登录状态
+  ai-cache/              # AI 缓存
+  artifacts/             # 执行证据与结果
+  logs/                  # 结构化日志
+cases/                   # Markdown 用例
+pages/                   # 生成的 Page Object
+tests/generated/         # 生成的 Playwright 测试
 playwright.config.ts
 ```
 
-The main configuration file is `.vole/vole.config.json`. Review these settings after initialization:
+## 使用
 
-- `baseUrl` points to the application under test.
-- `scanPages` lists pages available to bulk scanning.
-- `auth` defines the login flow and storage-state path.
-- `ai` selects the model endpoint, model name, and API-key source.
-- `runtimeAi` controls AI fallback, caching, self-healing, and agent limits.
-- `playwright` and `pageReady` control browser and readiness behavior.
-- `logging` controls the log level, location, retention, and file size.
+以下示例使用一个提供 `/settings` 页面的测试后台。请将地址、页面名称、元素和预期结果替换为你的应用内容。
 
-The default configuration reads the model credential from `OPENAI_API_KEY`:
+### 1. 配置项目和模型
 
-```bash
-export OPENAI_API_KEY="..."
+编辑 `.vole/vole.config.json`，修改以下字段，保留初始化生成的其他配置：
+
+```json
+{
+  "baseUrl": "http://127.0.0.1:4173",
+  "scanPages": [
+    { "name": "系统设置页面", "url": "/settings" }
+  ],
+  "ai": {
+    "provider": "openai-compatible",
+    "baseURL": "https://api.openai.com/v1",
+    "apiKeyEnv": "OPENAI_API_KEY",
+    "model": "gpt-4.1",
+    "temperature": 0.1,
+    "timeoutMs": 30000,
+    "maxRetries": 2,
+    "structuredOutputMode": "auto"
+  }
+}
 ```
 
-For another OpenAI-compatible provider, update `ai.baseURL`, `ai.apiKeyEnv`, and `ai.model`. The browser runtime agent requires tool calling; buildAgent uses structured output and does not require tool calling.
-
-## Quick start
-
-### Save authenticated browser state
-
-Run the login flow before scanning or testing protected pages:
+将 API Key 放入环境变量：
 
 ```bash
-node dist/cli/index.js auth login
+export OPENAI_API_KEY="你的 API Key"
 ```
 
-Vole saves browser state at the path configured by `auth.storageState`. Skip this step for public pages.
+使用其他兼容服务时，调整 `ai.baseURL`、`ai.model` 和 `ai.apiKeyEnv`。buildAgent 使用 `ai` 中的模型、超时及重试设置；浏览器中的 AI 执行还受 `runtimeAi` 配置控制。
 
-### Build the knowledge base
-
-Scan every page listed in `scanPages` and import the results:
+如果页面需要登录，先配置 `auth` 中的登录地址、账号、密码和元素选择器，然后执行：
 
 ```bash
-node dist/cli/index.js kb scan --all --import
+npx vole auth login
 ```
 
-For a review-first workflow, save a draft and import it after inspection:
+登录状态保存到 `auth.storageState` 指定的位置，生成的测试会引用该文件。测试公开页面时，可以在该位置准备内容为 `{"cookies":[],"origins":[]}` 的空状态文件。
+
+### 2. 扫描页面，建立知识库
+
+扫描配置中的所有页面并导入：
 
 ```bash
-node dist/cli/index.js kb scan \
-  --name "Orders" \
-  --url "/orders" \
-  --out ".vole/kb-drafts/orders.json"
-
-node dist/cli/index.js kb import .vole/kb-drafts/orders.json
-node dist/cli/index.js kb audit --page "Orders"
+npx vole kb scan --all --import
 ```
 
-Inspect imported records with:
+也可以先扫描单页，检查草稿后再导入：
 
 ```bash
-node dist/cli/index.js kb list pages
-node dist/cli/index.js kb list elements --page "Orders"
-node dist/cli/index.js kb list actions
+npx vole kb scan --name "系统设置页面" --url /settings --out .vole/kb-drafts/settings.json
+npx vole kb import .vole/kb-drafts/settings.json
 ```
 
-### Write a test case
+查看和检查知识库：
 
-Create a Markdown file under `cases/`:
+```bash
+npx vole kb list pages
+npx vole kb list elements --page "系统设置页面"
+npx vole kb list actions
+npx vole kb audit --page "系统设置页面"
+```
+
+用例中的页面和元素名称尽量与知识库保持一致。AI fallback 可以补充未匹配的操作，但无法解析的页面导航仍会阻止构建。
+
+### 3. 编写 Markdown 用例
+
+创建 `cases/settings-save.md`：
 
 ```markdown
-# 订单审批通过
+# 基础设置保存验证
 
 角色：admin
 
 前置条件：
-- 订单 ORD-001 已存在，状态为待审批；已保存管理员登录状态
+- 已保存管理员登录状态
+- 管理员有修改系统设置的权限
 
 步骤：
-- 进入订单管理页面
-- 搜索订单编号 ORD-001
-- 点击审批按钮
-- 点击通过按钮
-- 断言订单状态为已通过
+- 进入系统设置页面
+- 在系统名称输入框输入 Vole 测试系统
+- 点击保存设置按钮
+- 断言提示消息为设置已保存
 ```
 
-The level-one heading is the case name. Role and preconditions are optional. Use the Chinese section labels shown above; step lists use `-` bullets.
+格式约定：
 
-Default AI builds also accept a goal without a step list:
+- `# 标题` 必填，作为用例名称。
+- `角色：` 和 `前置条件：` 可选。
+- `步骤：` 下使用 `- ` 列表，描述业务操作和明确的预期结果。
+- 前置条件是执行前需要满足的环境要求，不会自动转成登录或创建数据的操作。
+
+默认 AI 构建也支持目标式用例：
 
 ```markdown
-# 订单审批通过
-
-角色：admin
+# 基础设置保存验证
 
 前置条件：
-- 订单 ORD-001 已存在，状态为待审批；已保存管理员登录状态
+- 已保存具有系统设置修改权限的管理员登录状态
 
-## 目标
-在订单管理页面审批订单 ORD-001，验证该订单的状态变为已通过。
+目标：
+进入系统设置页面，将系统名称修改为 Vole 测试系统并保存，验证提示消息为设置已保存。
 ```
 
-`目标：` followed by inline or multiline text is also supported. Goals and steps can be combined. The built-in rules parser and standalone `case compile` still require at least one explicit step.
+`目标：` 也可以写成 `## 目标` 标题段落。目标和步骤可以同时提供；`--parser rules` 和独立的 `case compile` 仍要求显式步骤。
 
-### Build and run
+### 4. 构建测试脚本
 
 ```bash
-node dist/cli/index.js case build cases/order-approve.md --parser ai
+npx vole case build cases/settings-save.md --out tests/generated/settings-save.spec.ts
 ```
 
-`case build` defaults to `--parser ai`, which uses buildAgent in two stages:
+默认使用 `--parser ai`。buildAgent 会读取完整用例及知识库摘要，拆分复合操作、单独列出断言，再将规划步骤逐一转换为 TestPlan。生成脚本后执行 TypeScript 校验。
 
-1. Read the complete case and the knowledge-base semantic summary; identify the goal, acceptance criteria, and ordered actions and assertions.
-2. Convert those steps one-for-one into a TestPlan, then resolve against the same knowledge-base snapshot, generate Playwright code, and validate TypeScript.
+构建产物：
 
-buildAgent uses `ai.model`, `ai.timeoutMs`, and `ai.maxRetries`. It does not launch a browser or execute the test. Preconditions remain environment requirements, rather than implicit setup actions. It does not invent required data or expected outcomes.
-
-The first stage saves `.vole/generated/plans/<case-slug>.build.json` with the goal, preconditions, acceptance criteria, steps (instruction, action/assertion kind, and source), and `missingItems`. If information is missing, the build prints the missing items and stops that case before compilation or script generation. Inspect this file, update the case or knowledge base, and rebuild. Successful builds also save the existing `.plan.json` and `.resolved.json` artifacts. A failed rebuild does not remove older successful artifacts; the current command result determines whether the build succeeded.
-
-Use `--parser rules` for the existing deterministic compilation path. `case compile`, `case resolve`, and `case generate` retain their separate workflows. Build every local case with:
-
-```bash
-node dist/cli/index.js case build --all --parser ai
-```
-
-Run the generated spec and inspect its result:
-
-```bash
-node dist/cli/index.js run tests/generated/case-example.spec.ts
-node dist/cli/index.js kb list runs
-node dist/cli/index.js diagnose <run-id>
-```
-
-`diagnose` accepts either a run ID or a Playwright JSON report path.
-
-## Static resolution and AI fallback
-
-The resolver searches records within the active page, removes low-confidence candidates, and rejects candidates with incompatible element types.
-
-| Resolution result | Runtime AI enabled | Runtime AI disabled |
-| --- | --- | --- |
-| One page, element, or business action matches | Generate static Playwright code | Generate static Playwright code |
-| No action element matches, or several elements match | Generate `ai-act` | Stop the build as unresolved or ambiguous |
-| Any assertion, including a known element | Generate `ai-assert` | Stop the build |
-| No business action matches, or several actions match | Generate `ai-agent` | Stop the build as unresolved or ambiguous |
-| Page navigation is missing or ambiguous | Stop the build | Stop the build |
-
-AI fallback only changes generated test code. It does not write runtime findings back to SQLite.
-
-### Exercise observe, act, agent, and extract
-
-`cases/build-agent-runtime-capabilities.md` covers product filtering, structured extraction, and an agent task that restores the full list. Build it with an isolated knowledge base containing only the product page:
-
-```bash
-npm run build
-node examples/build-agent-runtime-smoke.mjs
-```
-
-This calls the configured model and writes plans and scripts under `.vole/build-agent-runtime-smoke/`, without changing the main knowledge base or starting a browser. The example runner overwrites its own generated scripts on subsequent runs.
-
-The example cases use the same `# title`, `前置条件：`, and `步骤：` bullet-list format as the other cases. They contain business instructions without API names or special test-data/acceptance sections. buildAgent chooses capabilities from the intent and knowledge-base coverage:
-
-- Clear individual interactions use static locators when available and `ai.act` otherwise. `act` can also handle a tightly coupled two-step interaction and repair stale locators.
-- Unknown clicks use `ai.observe` to discover current actions. A unique click candidate is executed immediately with `ai.act(candidate)`; zero or multiple candidates fall back to the complete original instruction. Observation alone neither acts nor asserts.
-- Bounded tasks requiring live page decisions, such as clearing all filters, remain `businessAction` steps and use `ai.agent` when no KB action matches. The agent verifies its own completion, while case assertions remain separate.
-- Data-recording steps use `extract`, whose `fields` map names to `{ description }`. Results are stored in the shared context. Extraction is not an assertion; legacy field expectations are checked via `this.ai.assert`.
-- All assertions use `this.ai.assert`: `assertText` uses text equality (or containment for lists), `assertVisible` checks visibility, and `assertSemantic` handles counts or multiple conditions. Generated code does not use Playwright `expect`.
-
-These AI operations require `runtimeAi.enabled`. Standalone `observe` is supported for explicit observation instructions; it is not automatically inserted as an unused preliminary step.
-
-## AI Runtime
-
-Use `act` for one browser instruction:
-
-```bash
-node dist/cli/index.js act "Click the search button" --url /products
-```
-
-Use `agent` for a multi-step task:
-
-```bash
-node dist/cli/index.js agent \
-  "Clear all filters and verify that every product is visible" \
-  --url /products \
-  --max-steps 12
-```
-
-Applications can also import the runtime:
-
-```ts
-import type { Page } from '@playwright/test';
-import { z } from 'zod';
-import { createAiRuntime } from 'vole/runtime-ai';
-
-export async function approveOrder(page: Page) {
-  const runtime = createAiRuntime(page);
-
-  try {
-    const actions = await runtime.observe('Find the approve button');
-    await runtime.act(actions[0]);
-
-    const order = await runtime.extract(
-      'Read the current order status',
-      z.object({ status: z.string() })
-    );
-
-    await runtime.assert({
-      instruction: 'Verify that the order is approved',
-      kind: 'text',
-      target: 'Order status',
-      expected: 'Approved'
-    });
-
-    return order;
-  } finally {
-    await runtime.close();
-  }
-}
-```
-
-Run a multi-step agent through the same runtime:
-
-```ts
-const agent = runtime.agent({ mode: 'dom' });
-const result = await agent.execute({
-  instruction: 'Approve the order and verify its final status',
-  maxSteps: 10
-});
-```
-
-`observe` returns actions that can be passed directly to `act`. When an action fails, self-healing captures a new page snapshot and repairs the selector while preserving the original method and arguments.
-
-Instructions support `%variableName%` placeholders:
-
-```ts
-await runtime.act({
-  instruction: 'Fill the email field with %email%',
-  variables: {
-    email: {
-      value: 'user@example.com',
-      description: 'Account email'
-    }
-  }
-});
-```
-
-The runtime combines Chromium DOM and accessibility data. It supports iframes, out-of-process iframes, open and closed Shadow DOM, and scoped selectors. Password values are removed while the snapshot is built.
-
-The DOM agent uses AI SDK tool calling and limits navigation to same-origin pages by default. It supports streaming, callbacks, custom tools, message continuation, Zod output, token usage, and execution evidence.
-
-## Runtime configuration
-
-```json
-{
-  "runtimeAi": {
-    "enabled": true,
-    "timeoutMs": 30000,
-    "selfHeal": true,
-    "snapshotMaxChars": 60000,
-    "cacheDir": ".vole/ai-cache",
-    "artifactsDir": ".vole/artifacts/ai",
-    "thinking": "disabled",
-    "agent": {
-      "maxSteps": 8,
-      "timeoutMs": 120000,
-      "toolTimeoutMs": 30000,
-      "sameOriginOnly": true
-    }
-  }
-}
-```
-
-Disabling `runtimeAi.enabled` leaves static generation unchanged and turns unresolved AI-compatible steps into build errors.
-
-## Logging
-
-```json
-{
-  "logging": {
-    "enabled": true,
-    "level": "info",
-    "directory": ".vole/logs",
-    "retentionDays": 30,
-    "maxFileSizeMb": 20
-  }
-}
-```
-
-Vole writes one directory per CLI invocation:
-
-```text
-.vole/logs/YYYY-MM-DD/<invocationId>/
-  cli.jsonl
-  worker-<pid>.jsonl
-```
-
-The CLI process and Playwright workers share one `invocationId`. Vole rotates files after `maxFileSizeMb` and removes owned log files older than `retentionDays`.
-
-Logs contain diagnostic metadata such as model names, durations, token usage, statuses, hashes, counts, and artifact paths. They do not contain prompts, model responses, DOM text, form values, API keys, cookies, storage state, or screenshot data.
-
-Library consumers can inject a `VoleLogger` through `createAiRuntime(page, { logger })`. The runtime remains silent and does not create files when no logger is supplied.
-
-## Local data and security
-
-| Path | Contents |
+| 产物 | 内容 |
 | --- | --- |
-| `.vole/kb.sqlite` | Pages, elements, business actions, test plans, and run records |
-| `.vole/generated/plans` | Compiled and resolved test plans |
-| `.vole/ai-cache` | Action and agent trajectory cache |
-| `.vole/artifacts/ai` | AI action, assertion, agent history, and failure evidence |
-| `.vole/artifacts/results` | Playwright results, traces, and screenshots |
-| `.vole/logs` | CLI, worker, and AI Runtime JSONL logs |
-| `.vole/auth` | Playwright storage state |
+| `.vole/generated/plans/<用例名>.build.json` | 测试目标、验收条件、拆解步骤与缺失项 |
+| `.vole/generated/plans/<用例名>.plan.json` | 结构化 TestPlan |
+| `.vole/generated/plans/<用例名>.resolved.json` | 知识库匹配与 AI fallback 结果 |
+| `pages/*.page.ts` | Page Object，包含具体操作与 AI 断言 |
+| `tests/generated/*.spec.ts` | Playwright 测试入口 |
 
-Vole ignores local configuration, authentication state, caches, artifacts, logs, the SQLite database, cases, generated tests, and local project documentation. Keep API keys in environment variables.
+实际文件名以终端输出为准。未指定 `--out` 时，Vole 自动生成脚本文件名。
 
-Model-generated actions cannot invent local upload paths. Upload paths must come from the test plan or the calling application. Cache keys remove variable values, and the logger redacts sensitive fields before serialization.
+如果缺少关键数据或预期结果，终端会列出阻塞原因，并保留 `.build.json` 供检查。补充用例或知识库后重新构建；失败不会删除历史成功产物，应以本次命令结果判断是否成功。
 
-## CLI reference
-
-```text
-vole init
-vole auth login
-
-vole kb scan [--name <name> --url <url> | --all] [--import]
-vole kb import <draftPath>
-vole kb audit [--page <name>]
-vole kb list pages|elements|actions|runs
-
-vole case compile <casePath> [--parser ai|rules]
-vole case resolve <planPath>
-vole case generate <resolvedPlanPath>
-vole case build [casePath | --all] [--parser ai|rules]
-
-vole act <instruction> [--url <url>] [--headed] [--model <model>] [--timeout <ms>]
-vole agent <instruction> [--url <url>] [--headed] [--model <model>] [--timeout <ms>] [--max-steps <count>]
-
-vole run <specPath>
-vole diagnose <runId|reportPath>
-```
-
-Show the complete command help with:
+常用选项：
 
 ```bash
-node dist/cli/index.js --help
-node dist/cli/index.js <command> --help
+# 覆盖已有脚本
+npx vole case build cases/settings-save.md --out tests/generated/settings-save.spec.ts --overwrite
+
+# 批量构建 caseDir 中的用例，逐例处理并汇总失败
+npx vole case build --all
+
+# 使用规则编译器，跳过 AI 目标理解与拆解
+npx vole case build cases/settings-save.md --parser rules
 ```
+
+默认禁止覆盖已有脚本。`--out` 和 `--page-object-out` 仅用于单个用例。规则构建不调用模型进行规划，但生成脚本中的 AI 断言和 fallback 在执行时仍需要模型。
+
+### 5. 执行和诊断
+
+执行前检查生成的计划和脚本，确保登录状态、测试数据及其他前置条件已经准备好：
+
+```bash
+npx vole run tests/generated/settings-save.spec.ts
+npx vole kb list runs
+```
+
+使用运行记录中的 ID 查看诊断：
+
+```bash
+npx vole diagnose <run-id>
+```
+
+`diagnose` 也接受 Playwright JSON 报告路径。执行结果、截图、trace 和 AI 证据保存在 `.vole/artifacts/`；结构化日志保存在 `.vole/logs/`。
+
+### AI 运行时能力
+
+当知识库缺少可靠匹配时，Vole 根据步骤意图选择运行时能力：
+
+| 能力 | 用途 |
+| --- | --- |
+| `ai.act` | 执行明确的操作，例如输入、点击、选择 |
+| `ai.observe` | 观察页面并返回候选操作，本身不执行操作或断言 |
+| `ai.agent` | 完成需要根据当前页面进行多步决策的任务 |
+| `ai.extract` | 按结构提取页面数据，供后续步骤使用 |
+| `ai.assert` | 验证文本、可见性或业务条件 |
+
+实际 API 名为 `observe`。未知点击可先通过 `observe` 找到候选，再交给 `act` 执行；无法匹配的业务动作可交给 `agent`。数据提取不代替断言，生成脚本中的业务断言统一调用 `this.ai.assert`。
+
+这些能力需要 `runtimeAi.enabled: true`。关闭后，需要 AI fallback 或 AI 断言的步骤会阻止构建。运行时发现不会自动回写知识库。
+
+也可以直接从命令行执行 AI 操作：
+
+```bash
+npx vole act "点击保存设置按钮" --url /settings
+npx vole agent "清除商品列表的所有筛选条件" --url /products --max-steps 12
+```
+
+在自定义 Playwright 代码中使用运行时入口：
+
+```ts
+import { createAiRuntime } from '@jeffyang07/vole/runtime-ai';
+
+const ai = createAiRuntime(page);
+try {
+  const result = await ai.act('点击保存设置按钮');
+  if (!result.success) throw new Error(result.message);
+  await ai.assert({
+    instruction: '验证保存成功提示',
+    kind: 'text',
+    target: '提示消息',
+    expected: '设置已保存'
+  });
+} finally {
+  await ai.close();
+}
+```
+
+### 命令速查
+
+| 命令 | 用途 |
+| --- | --- |
+| `npx vole init` | 初始化项目 |
+| `npx vole auth login` | 登录并保存浏览器状态 |
+| `npx vole kb scan` | 扫描页面并生成知识库草稿 |
+| `npx vole kb import <draftPath>` | 导入知识库草稿 |
+| `npx vole kb list <target>` | 查看页面、元素、动作或运行记录 |
+| `npx vole kb audit` | 检查知识库质量 |
+| `npx vole case build <casePath>` | 理解、规划、匹配、生成并校验脚本 |
+| `npx vole case compile <casePath>` | 单独编译 TestPlan |
+| `npx vole case resolve <planPath>` | 单独匹配知识库 |
+| `npx vole case generate <resolvedPlanPath>` | 根据匹配结果生成脚本 |
+| `npx vole run <specPath>` | 执行测试并保存运行记录 |
+| `npx vole diagnose <runId或reportPath>` | 分析运行结果 |
+
+查看完整参数：
+
+```bash
+npx vole --help
+npx vole case build --help
+npx vole kb scan --help
+```
+
+## 开发与常见问题
+
+从源码运行：
+
+```bash
+npm ci
+npx playwright install chromium
+npm run build
+node dist/cli/index.js --help
+npm test
+npm run test:runtime-ai
+```
+
+- **切换 Node.js 后 SQLite 加载失败**：运行 `npm rebuild better-sqlite3` 重建原生模块。
+- **页面导航无法解析**：检查页面是否导入知识库、名称是否一致、地址是否正确。
+- **目标式用例构建失败**：确认使用默认 AI 构建，检查模型配置及 `.build.json` 中的缺失项。
+- **提示文件已存在**：检查现有文件后使用 `--overwrite`，或通过 `--out` 指定新路径。
+- **旧脚本导入 `vole/runtime-ai`**：迁移到作用域包后重新生成，入口应为 `@jeffyang07/vole/runtime-ai`。
+
+API Key 使用环境变量传入。初始化会将本地配置、登录状态、知识库、缓存、日志和执行产物加入 `.gitignore`；提交前仍需检查待提交文件。
+
+## 许可证
+
+当前为 `UNLICENSED`，尚未授予开源许可，详见 [LICENSE](./LICENSE)。
