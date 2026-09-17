@@ -1,5 +1,7 @@
 # Vole
 
+[简体中文](./README.md) | [English](./README.en.md)
+
 AI 驱动的 Web 自动化测试工具，支持测试意图理解、脚本生成与 Playwright 测试执行。
 
 ## 介绍
@@ -318,4 +320,4 @@ API Key 使用环境变量传入。初始化会将本地配置、登录状态、
 
 ## 许可证
 
-当前为 `UNLICENSED`，尚未授予开源许可，详见 [LICENSE](./LICENSE)。
+本项目采用 [MIT 开源许可证](./LICENSE)。
